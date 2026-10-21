@@ -8,6 +8,14 @@ Monorepo para un puente BLE nativo entre Galaxy Watch 6 Classic (Wear OS 4+) y i
 - `backend/`: Node.js + Fastify + WebSockets + Zod (hub de sincronización)
 - `web-companion/`: PWA React + Vite + Tailwind (panel de control y telemetría)
 
+## Guías
+
+| Guía | Descripción |
+|------|-------------|
+| [docs/DEPLOY.md](docs/DEPLOY.md) | Despliegue en producción (Railway + Vercel) |
+| [docs/APPLE_SHORTCUTS.md](docs/APPLE_SHORTCUTS.md) | Atajo de iOS → Apple Health (peso, % grasa, pasos) |
+| [docs/SHM_MOD.md](docs/SHM_MOD.md) | Samsung Health Monitor MOD (ECG + Presión Arterial) |
+
 ## Guía de Aprovisionamiento y Emparejamiento
 
 ### Fase 1: Preparar el Galaxy Watch 6 Classic
@@ -33,11 +41,22 @@ cd watch-app
 ./gradlew assembleDebug
 adb -s 192.168.1.45:41555 install -r build/outputs/apk/debug/watch-app-debug.apk
 
-# Permisos
+# Permisos BLE
 adb -s 192.168.1.45:41555 shell pm grant com.ancsbridge.watch android.permission.BLUETOOTH_SCAN
 adb -s 192.168.1.45:41555 shell pm grant com.ancsbridge.watch android.permission.BLUETOOTH_CONNECT
 adb -s 192.168.1.45:41555 shell pm grant com.ancsbridge.watch android.permission.BLUETOOTH_ADVERTISE
 adb -s 192.168.1.45:41555 shell pm grant com.ancsbridge.watch android.permission.POST_NOTIFICATIONS
+
+# Permisos HFP + Salud (v2.0)
+adb -s 192.168.1.45:41555 shell pm grant com.ancsbridge.watch android.permission.ANSWER_PHONE_CALLS
+adb -s 192.168.1.45:41555 shell pm grant com.ancsbridge.watch android.permission.READ_PHONE_STATE
+adb -s 192.168.1.45:41555 shell pm grant com.ancsbridge.watch android.permission.CALL_PHONE
+adb -s 192.168.1.45:41555 shell pm grant com.ancsbridge.watch android.permission.BODY_SENSORS
+adb -s 192.168.1.45:41555 shell pm grant com.ancsbridge.watch android.permission.ACTIVITY_RECOGNITION
+adb -s 192.168.1.45:41555 shell pm grant com.ancsbridge.watch android.permission.health.READ_STEPS
+adb -s 192.168.1.45:41555 shell pm grant com.ancsbridge.watch android.permission.health.READ_HEART_RATE
+adb -s 192.168.1.45:41555 shell pm grant com.ancsbridge.watch android.permission.health.READ_WEIGHT
+adb -s 192.168.1.45:41555 shell pm grant com.ancsbridge.watch android.permission.health.READ_BODY_FAT
 
 # Excluir de Doze
 adb -s 192.168.1.45:41555 shell dumpsys deviceidle whitelist +com.ancsbridge.watch
@@ -60,6 +79,8 @@ npm run dev
 # o docker-compose up --build desde la raíz
 ```
 
+Para producción ver [docs/DEPLOY.md](docs/DEPLOY.md).
+
 ## Web Companion
 
 ```bash
@@ -68,5 +89,7 @@ npm install
 npm run dev
 # Configura VITE_WS_URL si el backend no está en localhost:8080
 ```
+
+Para producción (Vercel/Netlify) ver [docs/DEPLOY.md](docs/DEPLOY.md).
 
 El reloj se conecta automáticamente al WebSocket del backend para telemetría, filtros de Bundle ID y alertas remotas.

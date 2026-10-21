@@ -11,7 +11,11 @@ backend/dist/
 web-companion/node_modules/
 web-companion/dist/
 
+# Persistence
+backend/bridge-state.json
+
 # OS
 .DS_Store
 Thumbs.db
 *.log
+.env

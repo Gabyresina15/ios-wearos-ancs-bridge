@@ -3,9 +3,22 @@ import React, { useEffect, useRef, useState } from "react";
 interface WatchStatus {
   state: string;
   stateLabel: string;
+  hfpConnected: boolean;
+  watchBatteryPercent: number;
+  isCharging: boolean;
   deviceModel: string;
   pairedIphone: string;
   lastSeen: number;
+}
+
+interface TelemetryData {
+  watchBatteryPercent: number;
+  isCharging: boolean;
+  stepsToday: number;
+  latestHeartRateBpm: number;
+  weightKg: number | null;
+  bodyFatPercentage: number | null;
+  timestamp: number;
 }
 
 interface AncsNotification {
@@ -26,9 +39,21 @@ export default function App() {
   const [watchStatus, setWatchStatus] = useState<WatchStatus>({
     state: "DISCONNECTED",
     stateLabel: "Desconectado",
+    hfpConnected: false,
+    watchBatteryPercent: 0,
+    isCharging: false,
     deviceModel: "Galaxy Watch 6 Classic",
     pairedIphone: "iPhone 16 Pro Max",
     lastSeen: 0,
+  });
+  const [telemetry, setTelemetry] = useState<TelemetryData>({
+    watchBatteryPercent: 0,
+    isCharging: false,
+    stepsToday: 0,
+    latestHeartRateBpm: 0,
+    weightKg: null,
+    bodyFatPercentage: null,
+    timestamp: 0,
   });
   const [notifications, setNotifications] = useState<AncsNotification[]>([]);
   const [blockedBundles, setBlockedBundles] = useState<string[]>([]);
@@ -52,10 +77,13 @@ export default function App() {
         const payload = JSON.parse(event.data);
         if (payload.type === "INITIAL_SNAPSHOT") {
           setWatchStatus(payload.data.watchStatus);
+          setTelemetry(payload.data.telemetry);
           setNotifications(payload.data.notificationHistory);
           setBlockedBundles(payload.data.blockedBundles);
         } else if (payload.type === "WATCH_STATUS_UPDATED") {
           setWatchStatus(payload.data);
+        } else if (payload.type === "TELEMETRY_UPDATED") {
+          setTelemetry(payload.data);
         } else if (payload.type === "NEW_ANCS_NOTIFICATION") {
           setNotifications((prev) =>
             [payload.data, ...prev.filter((n) => n.uid !== payload.data.uid)].slice(0, 50)
@@ -84,6 +112,10 @@ export default function App() {
     );
   };
 
+  const requestTelemetry = () => {
+    wsRef.current?.send(JSON.stringify({ type: "REQUEST_TELEMETRY" }));
+  };
+
   const toggleBlockBundle = (bundleId: string) => {
     const updated = blockedBundles.includes(bundleId)
       ? blockedBundles.filter((b) => b !== bundleId)
@@ -104,17 +136,17 @@ export default function App() {
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 p-6 font-sans">
       <div className="max-w-4xl mx-auto space-y-6">
-        {/* Header */}
+        {/* Header con Estado BLE y HFP */}
         <header className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-zinc-900 border border-zinc-800 p-5 rounded-2xl">
           <div>
             <h1 className="text-xl font-bold tracking-tight">
               GW6 Classic ⇄ iPhone 16 Pro Max Bridge
             </h1>
             <p className="text-xs text-zinc-400 mt-1">
-              Cliente BLE ANCS/AMS Nativo + Telemetría WebSocket
+              ANCS + AMS + HFP (Llamadas) + Health Connect
             </p>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-2">
             <span
               className={`px-3 py-1 rounded-full text-xs font-semibold ${
                 watchStatus.state === "READY"
@@ -126,6 +158,15 @@ export default function App() {
             </span>
             <span
               className={`px-3 py-1 rounded-full text-xs font-semibold ${
+                watchStatus.hfpConnected
+                  ? "bg-indigo-500/20 text-indigo-400 border border-indigo-500/30"
+                  : "bg-zinc-800 text-zinc-400 border border-zinc-700"
+              }`}
+            >
+              HFP: {watchStatus.hfpConnected ? "Voz Activa" : "Standby"}
+            </span>
+            <span
+              className={`px-3 py-1 rounded-full text-xs font-semibold ${
                 wsConnected ? "bg-sky-500/20 text-sky-400" : "bg-red-500/20 text-red-400"
               }`}
             >
@@ -134,11 +175,55 @@ export default function App() {
           </div>
         </header>
 
+        {/* Tarjetas de Telemetría (Batería y Salud) */}
+        <section className="bg-zinc-900 border border-zinc-800 p-5 rounded-2xl space-y-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold uppercase tracking-wider text-zinc-400">
+              Telemetría y Salud del Reloj
+            </h2>
+            <button
+              onClick={requestTelemetry}
+              className="bg-zinc-800 hover:bg-zinc-700 text-xs px-3 py-1 rounded-lg transition"
+            >
+              Actualizar Ahora 🔄
+            </button>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+            <div className="bg-zinc-950 border border-zinc-800 p-3.5 rounded-xl">
+              <span className="text-xs text-zinc-400">Batería Reloj</span>
+              <p className="text-lg font-bold mt-1">
+                {telemetry.watchBatteryPercent}%{" "}
+                {telemetry.isCharging && <span className="text-emerald-400 text-xs">⚡ Carga</span>}
+              </p>
+            </div>
+            <div className="bg-zinc-950 border border-zinc-800 p-3.5 rounded-xl">
+              <span className="text-xs text-zinc-400">Pasos Hoy</span>
+              <p className="text-lg font-bold mt-1 text-emerald-400">
+                {telemetry.stepsToday.toLocaleString()} 👣
+              </p>
+            </div>
+            <div className="bg-zinc-950 border border-zinc-800 p-3.5 rounded-xl">
+              <span className="text-xs text-zinc-400">Frecuencia Cardíaca</span>
+              <p className="text-lg font-bold mt-1 text-rose-400">
+                {telemetry.latestHeartRateBpm} bpm ❤️
+              </p>
+            </div>
+            <div className="bg-zinc-950 border border-zinc-800 p-3.5 rounded-xl">
+              <span className="text-xs text-zinc-400">BIA (Peso / Grasa)</span>
+              <p className="text-sm font-bold mt-1 text-sky-400">
+                {telemetry.weightKg ? `${telemetry.weightKg} kg` : "--"} /{" "}
+                {telemetry.bodyFatPercentage ? `${telemetry.bodyFatPercentage}%` : "--"}
+              </p>
+            </div>
+          </div>
+        </section>
+
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           {/* Emisor de Alertas y AMS */}
           <section className="bg-zinc-900 border border-zinc-800 p-5 rounded-2xl space-y-4">
             <h2 className="text-sm font-semibold uppercase tracking-wider text-zinc-400">
-              Disparo de Alerta al Reloj & Control AMS
+              Disparo de Alerta & Control AMS
             </h2>
             <form onSubmit={sendTestAlert} className="space-y-3">
               <input
@@ -230,30 +315,43 @@ export default function App() {
         {/* Stream de notificaciones ANCS en vivo */}
         <section className="bg-zinc-900 border border-zinc-800 p-5 rounded-2xl space-y-3">
           <h2 className="text-sm font-semibold uppercase tracking-wider text-zinc-400">
-            Stream de Notificaciones ANCS Recibidas ({notifications.length})
+            Stream de Notificaciones y Llamadas ANCS ({notifications.length})
           </h2>
           <div className="space-y-2 max-h-96 overflow-y-auto">
-            {notifications.map((n) => (
-              <div
-                key={n.uid}
-                className="flex items-start justify-between bg-zinc-950 border border-zinc-800/80 p-3 rounded-xl"
-              >
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs font-bold text-emerald-400">{n.appDisplayName}</span>
-                    <span className="text-[11px] text-zinc-500 font-mono">({n.appIdentifier})</span>
-                  </div>
-                  <p className="text-sm font-semibold mt-0.5">{n.title}</p>
-                  <p className="text-xs text-zinc-400">{n.message || n.subtitle}</p>
-                </div>
-                <button
-                  onClick={() => toggleBlockBundle(n.appIdentifier)}
-                  className="text-[11px] text-zinc-400 hover:text-red-400 border border-zinc-800 px-2 py-1 rounded-lg"
+            {notifications.map((n) => {
+              const isCall = n.appIdentifier === "com.apple.mobilephone";
+              return (
+                <div
+                  key={n.uid}
+                  className={`flex items-start justify-between border p-3 rounded-xl ${
+                    isCall
+                      ? "bg-emerald-950/20 border-emerald-500/30"
+                      : "bg-zinc-950 border-zinc-800/80"
+                  }`}
                 >
-                  Silenciar App
-                </button>
-              </div>
-            ))}
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={`text-xs font-bold ${
+                          isCall ? "text-emerald-400" : "text-emerald-400"
+                        }`}
+                      >
+                        {n.appDisplayName}
+                      </span>
+                      <span className="text-[11px] text-zinc-500 font-mono">({n.appIdentifier})</span>
+                    </div>
+                    <p className="text-sm font-semibold mt-0.5">{n.title}</p>
+                    <p className="text-xs text-zinc-400">{n.message || n.subtitle}</p>
+                  </div>
+                  <button
+                    onClick={() => toggleBlockBundle(n.appIdentifier)}
+                    className="text-[11px] text-zinc-400 hover:text-red-400 border border-zinc-800 px-2 py-1 rounded-lg"
+                  >
+                    Silenciar App
+                  </button>
+                </div>
+              );
+            })}
           </div>
         </section>
       </div>

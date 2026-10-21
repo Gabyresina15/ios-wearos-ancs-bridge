@@ -1,0 +1,17 @@
+# Android / Gradle
+watch-app/.gradle/
+watch-app/build/
+watch-app/local.properties
+watch-app/*.iml
+watch-app/.idea/
+
+# Node
+backend/node_modules/
+backend/dist/
+web-companion/node_modules/
+web-companion/dist/
+
+# OS
+.DS_Store
+Thumbs.db
+*.log

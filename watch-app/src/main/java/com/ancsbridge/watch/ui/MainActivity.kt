@@ -42,10 +42,8 @@ class MainActivity : ComponentActivity() {
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { grantResults ->
-        if (grantResults.values.all { it }) {
-            startAndBindBleService()
-        }
+    ) {
+        startAndBindBleService()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -56,7 +54,11 @@ class MainActivity : ComponentActivity() {
                 Manifest.permission.BLUETOOTH_SCAN,
                 Manifest.permission.BLUETOOTH_CONNECT,
                 Manifest.permission.BLUETOOTH_ADVERTISE,
-                Manifest.permission.POST_NOTIFICATIONS
+                Manifest.permission.POST_NOTIFICATIONS,
+                Manifest.permission.ANSWER_PHONE_CALLS,
+                Manifest.permission.READ_PHONE_STATE,
+                Manifest.permission.BODY_SENSORS,
+                Manifest.permission.ACTIVITY_RECOGNITION
             )
         )
 
@@ -85,8 +87,12 @@ fun WatchBridgeScreen(service: AncsBleService?) {
 
     val connState by service?.connectionState?.collectAsState()
         ?: remember { mutableStateOf(BleConnectionState.DISCONNECTED) }
+    val hfpConnected by service?.isHfpConnected?.collectAsState()
+        ?: remember { mutableStateOf(false) }
     val autoReconnect by service?.autoReconnect?.collectAsState()
         ?: remember { mutableStateOf(true) }
+    val telemetry by service?.latestTelemetry?.collectAsState()
+        ?: remember { mutableStateOf(null) }
     val notifications by service?.notifications?.collectAsState()
         ?: remember { mutableStateOf(emptyList()) }
 
@@ -102,7 +108,6 @@ fun WatchBridgeScreen(service: AncsBleService?) {
             state = listState,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Indicador de estado BLE/ANCS
             item {
                 val badgeColor = when (connState) {
                     BleConnectionState.READY -> Color(0xFF10B981)
@@ -126,79 +131,102 @@ fun WatchBridgeScreen(service: AncsBleService?) {
                         )
                     },
                     secondaryLabel = {
-                        Text("iPhone 16 Pro Max", fontSize = 10.sp)
+                        val hfpLabel = if (hfpConnected) "HFP Voz Activo" else "HFP En espera"
+                        Text("iPhone 16 • $hfpLabel", fontSize = 10.sp)
                     }
                 )
             }
 
-            // Switch de Reconexión Automática
+            item {
+                Chip(
+                    onClick = { service?.syncTelemetryNow() },
+                    modifier = Modifier.fillMaxWidth(0.92f),
+                    colors = ChipDefaults.secondaryChipColors(),
+                    label = {
+                        val steps = telemetry?.stepsToday ?: 0L
+                        val hr = telemetry?.latestHeartRateBpm ?: 0L
+                        Text("👣 $steps pasos • ❤️ $hr bpm", fontSize = 11.sp)
+                    },
+                    secondaryLabel = {
+                        val weight = telemetry?.weightKg?.let { "${"%.1f".format(it)}kg" } ?: "--"
+                        val fat = telemetry?.bodyFatPercentage?.let { "${"%.1f".format(it)}%" } ?: "--"
+                        Text("BIA: $weight ($fat grasa) • Sync", fontSize = 10.sp)
+                    }
+                )
+            }
+
             item {
                 ToggleChip(
                     checked = autoReconnect,
                     onCheckedChange = { service?.setAutoReconnect(it) },
                     modifier = Modifier.fillMaxWidth(0.92f),
-                    label = { Text("Auto-Reconexión", fontSize = 12.sp) },
-                    toggleControl = {
-                        Switch(checked = autoReconnect)
-                    }
+                    label = { Text("Reconexión Low-Power", fontSize = 11.sp) },
+                    toggleControl = { Switch(checked = autoReconnect) }
                 )
             }
 
-            // Controles rápidos Apple Media Service (AMS)
             item {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth(0.9f)
-                        .padding(vertical = 4.dp),
+                        .padding(vertical = 2.dp),
                     horizontalArrangement = Arrangement.SpaceEvenly
                 ) {
-                    CompactButton(
-                        onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.PREVIOUS_TRACK) }
-                    ) { Text("⏮") }
-                    CompactButton(
-                        onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.TOGGLE_PLAY_PAUSE) }
-                    ) { Text("⏯") }
-                    CompactButton(
-                        onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.NEXT_TRACK) }
-                    ) { Text("⏭") }
+                    CompactButton(onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.PREVIOUS_TRACK) }) {
+                        Text("⏮")
+                    }
+                    CompactButton(onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.TOGGLE_PLAY_PAUSE) }) {
+                        Text("⏯")
+                    }
+                    CompactButton(onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.NEXT_TRACK) }) {
+                        Text("⏭")
+                    }
                 }
             }
 
-            // Lista de notificaciones activas recibidas por ANCS
-            if (notifications.isEmpty()) {
-                item {
-                    Text(
-                        text = "Sin notificaciones activas",
-                        color = Color.Gray,
-                        fontSize = 11.sp,
-                        modifier = Modifier.padding(top = 8.dp)
-                    )
-                }
-            } else {
-                items(notifications, key = { it.uid }) { item ->
-                    TitleCard(
-                        onClick = {
-                            // Al tocar la tarjeta, descartamos la notificación también en el iPhone vía Control Point
-                            service?.performNotificationAction(item.uid, AncsActionId.NEGATIVE)
-                        },
-                        title = {
-                            Text(
-                                text = "${item.appDisplayName} • ${item.title}",
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        },
-                        modifier = Modifier.fillMaxWidth(0.94f)
-                    ) {
+            items(notifications, key = { it.uid }) { item ->
+                val isCall = item.appIdentifier == "com.apple.mobilephone"
+                TitleCard(
+                    onClick = { service?.rejectOrDismissNotification(item) },
+                    title = {
+                        Text(
+                            text = "${item.appDisplayName} • ${item.title}",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (isCall) Color(0xFF34D399) else Color.White,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    },
+                    modifier = Modifier.fillMaxWidth(0.94f)
+                ) {
+                    Column {
                         Text(
                             text = item.message.ifEmpty { item.subtitle },
                             fontSize = 11.sp,
                             color = Color(0xFFD1D5DB),
-                            maxLines = 3,
+                            maxLines = 2,
                             overflow = TextOverflow.Ellipsis
                         )
+                        if (isCall) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 6.dp),
+                                horizontalArrangement = Arrangement.SpaceEvenly
+                            ) {
+                                CompactChip(
+                                    onClick = { service?.answerOrAcceptNotification(item) },
+                                    label = { Text("Contestar HFP", fontSize = 10.sp) },
+                                    colors = ChipDefaults.primaryChipColors(backgroundColor = Color(0xFF10B981))
+                                )
+                                CompactChip(
+                                    onClick = { service?.rejectOrDismissNotification(item) },
+                                    label = { Text("Cortar", fontSize = 10.sp) },
+                                    colors = ChipDefaults.primaryChipColors(backgroundColor = Color(0xFFEF4444))
+                                )
+                            }
+                        }
                     }
                 }
             }

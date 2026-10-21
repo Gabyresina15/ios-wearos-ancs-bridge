@@ -22,6 +22,7 @@ import android.util.Log
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import com.ancsbridge.watch.BuildConfig
+import com.ancsbridge.watch.health.HealthSyncManager
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -55,6 +56,8 @@ class AncsBleService : LifecycleService() {
     private var activeGatt: BluetoothGatt? = null
     private var connectedIphone: BluetoothDevice? = null
 
+    private val healthSyncManager by lazy { HealthSyncManager(this) }
+
     // Estado reactivo expuesto a Jetpack Compose
     private val _connectionState = MutableStateFlow(BleConnectionState.DISCONNECTED)
     val connectionState: StateFlow<BleConnectionState> = _connectionState.asStateFlow()
@@ -67,7 +70,7 @@ class AncsBleService : LifecycleService() {
 
     private val _blockedBundles = MutableStateFlow<Set<String>>(emptySet())
 
-    // Cola secuencial de operaciones GATT (Android falla si se ejecutan 2 operaciones simultáneas)
+    // Cola secuencial de operaciones GATT
     private sealed class GattOperation {
         data class WriteDescriptor(val descriptor: BluetoothGattDescriptor, val payload: ByteArray) : GattOperation()
         data class WriteCharacteristic(
@@ -84,13 +87,11 @@ class AncsBleService : LifecycleService() {
         handleParsedIosNotification(parsedNotification)
     }
 
-    // Cliente WebSocket hacia el Backend
     private val okHttpClient = OkHttpClient.Builder()
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
     private var webSocket: WebSocket? = null
 
-    // Receptor de eventos de emparejamiento (Bonding) con iOS
     private val bondStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             if (intent.action == BluetoothDevice.ACTION_BOND_STATE_CHANGED) {
@@ -115,6 +116,7 @@ class AncsBleService : LifecycleService() {
         registerReceiver(bondStateReceiver, IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED))
         connectWebSocket()
         startBleBridge()
+        startPeriodicHealthSync()
     }
 
     override fun onBind(intent: Intent): IBinder {
@@ -129,6 +131,22 @@ class AncsBleService : LifecycleService() {
         webSocket?.close(1000, "Service destroyed")
     }
 
+    private fun startPeriodicHealthSync() {
+        lifecycleScope.launch {
+            while (isActive) {
+                delay(10 * 60 * 1000L) // cada 10 minutos
+                runCatching {
+                    val snapshot = healthSyncManager.collectDailyHealthSnapshot()
+                    val payload = healthSyncManager.toWebSocketPayload(snapshot)
+                    webSocket?.send(payload)
+                    Log.i(TAG, "Health snapshot sent: steps=${snapshot.stepsToday}")
+                }.onFailure {
+                    Log.w(TAG, "Health sync failed: ${it.message}")
+                }
+            }
+        }
+    }
+
     fun setAutoReconnect(enabled: Boolean) {
         _autoReconnect.value = enabled
         if (enabled && _connectionState.value == BleConnectionState.DISCONNECTED) {
@@ -138,21 +156,15 @@ class AncsBleService : LifecycleService() {
         }
     }
 
-    /**
-     * Inicia el anuncio periférico (con Service Solicitation para ANCS) y levanta un GATT Server
-     * mínimo para que el iPhone muestre el reloj en Ajustes > Bluetooth.
-     */
     fun startBleBridge() {
         val adapter = bluetoothManager.adapter ?: return
         if (!adapter.isEnabled) return
 
-        // Renombrar el adaptador para identificarlo fácilmente en iOS
         adapter.name = "GW6-ANCS-Bridge"
 
         setupMinimalGattServer()
         startSolicitedAdvertising(adapter)
 
-        // Si ya existe un iPhone vinculado previamente en el llavero Bluetooth del reloj, reconectar directo
         adapter.bondedDevices?.firstOrNull()?.let { bondedDevice ->
             Log.i(TAG, "Intentando reconexión directa a dispositivo vinculado: ${bondedDevice.name}")
             connectToIphoneGatt(bondedDevice)
@@ -177,7 +189,6 @@ class AncsBleService : LifecycleService() {
             override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     Log.i(TAG, "iPhone conectado al GATT Server periférico: ${device.address}")
-                    // En cuanto el iPhone nos conecta desde Ajustes > Bluetooth, abrimos nuestro cliente GATT hacia él
                     if (activeGatt == null) {
                         connectToIphoneGatt(device)
                     }
@@ -185,7 +196,6 @@ class AncsBleService : LifecycleService() {
             }
         })
 
-        // Exponemos el servicio genérico 0x180D para que el filtro de Ajustes > Bluetooth de iOS muestre el reloj
         val hrService = BluetoothGattService(
             AppleBleUuids.GENERIC_HEART_RATE_SERVICE,
             BluetoothGattService.SERVICE_TYPE_PRIMARY
@@ -203,7 +213,6 @@ class AncsBleService : LifecycleService() {
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
             .build()
 
-        // Crítico: addServiceSolicitationUuid con ANCS indica a iOS que este periférico solicita ANCS
         val advertiseData = AdvertiseData.Builder()
             .setIncludeDeviceName(true)
             .addServiceSolicitationUuid(ParcelUuid(AppleBleUuids.ANCS_SERVICE))
@@ -230,7 +239,6 @@ class AncsBleService : LifecycleService() {
     private fun connectToIphoneGatt(device: BluetoothDevice) {
         connectedIphone = device
         updateConnectionState(BleConnectionState.CONNECTING)
-        // autoConnect = true permite que el stack BLE reconecte en hardware cuando el iPhone vuelva a rango
         activeGatt = device.connectGatt(
             this,
             _autoReconnect.value,
@@ -289,7 +297,6 @@ class AncsBleService : LifecycleService() {
                 return
             }
 
-            // REGLA DE ORO ANCS: Suscribir SIEMPRE Data Source ANTES que Notification Source
             val dataSourceChar = ancsService.getCharacteristic(AppleBleUuids.ANCS_DATA_SOURCE)
             val notifSourceChar = ancsService.getCharacteristic(AppleBleUuids.ANCS_NOTIFICATION_SOURCE)
 
@@ -298,7 +305,6 @@ class AncsBleService : LifecycleService() {
                 enableCharacteristicNotifications(gatt, notifSourceChar)
             }
 
-            // Suscribir Apple Media Service (AMS) si está disponible
             val amsService = gatt.getService(AppleBleUuids.AMS_SERVICE)
             val remoteCommandChar = amsService?.getCharacteristic(AppleBleUuids.AMS_REMOTE_COMMAND)
             if (remoteCommandChar != null) {
@@ -393,9 +399,6 @@ class AncsBleService : LifecycleService() {
         sendNotificationToBackend(notification)
     }
 
-    /**
-     * Ejecuta una acción sobre la notificación en el iPhone (Aceptar / Descartar) vía ANCS Control Point
-     */
     fun performNotificationAction(uid: Int, action: AncsActionId) {
         val controlPoint = activeGatt
             ?.getService(AppleBleUuids.ANCS_SERVICE)
@@ -416,9 +419,6 @@ class AncsBleService : LifecycleService() {
         }
     }
 
-    /**
-     * Envía comandos multimedia (Play/Pause/Next/Prev/Vol) al iPhone vía Apple Media Service (AMS)
-     */
     fun sendAmsMediaCommand(command: AmsRemoteCommandId) {
         val remoteCommandChar = activeGatt
             ?.getService(AppleBleUuids.AMS_SERVICE)
@@ -489,10 +489,6 @@ class AncsBleService : LifecycleService() {
         notificationManager.notify(FG_NOTIFICATION_ID, buildForegroundNotification(newState.label))
         sendStatusToBackend(newState)
     }
-
-    // =========================================================================
-    // Sincronización WebSocket con Backend Node.js / Fastify
-    // =========================================================================
 
     private fun connectWebSocket() {
         val request = Request.Builder().url(BuildConfig.WS_BACKEND_URL).build()

@@ -48,6 +48,14 @@ const IncomingMessageSchema = z.discriminatedUnion("type", [
       "VOLUME_DOWN",
     ]),
   }),
+  z.object({
+    type: z.literal("HEALTH_SYNC"),
+    stepsToday: z.number(),
+    latestHeartRateBpm: z.number(),
+    weightKg: z.number().nullable(),
+    bodyFatPercentage: z.number().nullable(),
+    timestamp: z.number(),
+  }),
 ]);
 
 type AncsNotificationLog = z.infer<typeof IncomingMessageSchema> & {
@@ -65,6 +73,15 @@ const bridgeState = {
   },
   blockedBundles: ["com.apple.tips"] as string[],
   notificationHistory: [] as AncsNotificationLog[],
+};
+
+// Métricas de salud más recientes (para Apple Shortcuts / PWA)
+let latestHealthMetrics = {
+  stepsToday: 0,
+  latestHeartRateBpm: 0,
+  weightKg: null as number | null,
+  bodyFatPercentage: null as number | null,
+  timestamp: 0,
 };
 
 const watchClients = new Set<SocketStream["socket"]>();
@@ -88,7 +105,13 @@ fastify.get("/health", async () => ({
   status: "ok",
   watchConnected: watchClients.size > 0,
   state: bridgeState.watchStatus,
+  health: latestHealthMetrics,
 }));
+
+// Endpoint para el Atajo de iOS (Apple Shortcuts) → Apple Health
+fastify.get("/api/health/latest", async () => {
+  return latestHealthMetrics;
+});
 
 fastify.register(async (app) => {
   app.get("/ws", { websocket: true }, (connection, req) => {
@@ -109,6 +132,7 @@ fastify.register(async (app) => {
         JSON.stringify({
           type: "INITIAL_SNAPSHOT",
           data: bridgeState,
+          health: latestHealthMetrics,
         })
       );
     }
@@ -147,6 +171,17 @@ fastify.register(async (app) => {
 
           case "AMS_COMMAND":
             broadcastToWatch(msg);
+            break;
+
+          case "HEALTH_SYNC":
+            latestHealthMetrics = {
+              stepsToday: msg.stepsToday,
+              latestHeartRateBpm: msg.latestHeartRateBpm,
+              weightKg: msg.weightKg,
+              bodyFatPercentage: msg.bodyFatPercentage,
+              timestamp: msg.timestamp,
+            };
+            broadcastToWeb({ type: "HEALTH_UPDATED", data: latestHealthMetrics });
             break;
         }
       } catch (err) {

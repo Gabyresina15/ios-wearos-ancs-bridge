@@ -9,13 +9,13 @@ android {
 
     defaultConfig {
         applicationId = "com.ancsbridge.watch"
-        minSdk = 33 // Wear OS 4 (Galaxy Watch 6 Classic base SDK)
+        minSdk = 33
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "2.0.0"
 
-        // URL del backend (ajustable desde la UI o en compilación)
         buildConfigField("String", "WS_BACKEND_URL", "\"wss://tu-backend.up.railway.app/ws?role=watch\"")
+        buildConfigField("String", "HTTP_BACKEND_URL", "\"https://tu-backend.up.railway.app\"")
     }
 
     buildFeatures {
@@ -45,12 +45,13 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.2")
     implementation("androidx.lifecycle:lifecycle-service:2.8.2")
 
-    // Coroutines
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    // WorkManager para Doze Mode y sincronización periódica
+    implementation("androidx.work:work-runtime-ktx:2.9.0")
 
-    // OkHttp (Cliente WebSocket resiliente y ligero)
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
-
-    // Health Connect (pasos, FC, peso, % grasa BIA)
+    // Health Connect
     implementation("androidx.health.connect:connect-client:1.1.0-alpha07")
+
+    // Coroutines & OkHttp
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }

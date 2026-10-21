@@ -50,4 +50,7 @@ dependencies {
 
     // OkHttp (Cliente WebSocket resiliente y ligero)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // Health Connect (pasos, FC, peso, % grasa BIA)
+    implementation("androidx.health.connect:connect-client:1.1.0-alpha07")
 }

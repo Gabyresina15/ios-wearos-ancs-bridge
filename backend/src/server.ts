@@ -2,11 +2,15 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import websocket, { SocketStream } from "@fastify/websocket";
 import { z } from "zod";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
 
 const fastify = Fastify({ logger: true });
 
 await fastify.register(cors, { origin: "*" });
 await fastify.register(websocket);
+
+const DATA_FILE = join(process.cwd(), "bridge-state.json");
 
 const TelemetryPayloadSchema = z.object({
   watchBatteryPercent: z.number().int().min(0).max(100),
@@ -82,7 +86,23 @@ type AncsNotificationLog = Extract<
 
 type TelemetryData = z.infer<typeof TelemetryPayloadSchema>;
 
-const bridgeState = {
+interface BridgeState {
+  watchStatus: {
+    state: string;
+    stateLabel: string;
+    hfpConnected: boolean;
+    watchBatteryPercent: number;
+    isCharging: boolean;
+    deviceModel: string;
+    pairedIphone: string;
+    lastSeen: number;
+  };
+  telemetry: TelemetryData;
+  blockedBundles: string[];
+  notificationHistory: AncsNotificationLog[];
+}
+
+const defaultState: BridgeState = {
   watchStatus: {
     state: "DISCONNECTED",
     stateLabel: "Desconectado",
@@ -98,13 +118,36 @@ const bridgeState = {
     isCharging: false,
     stepsToday: 0,
     latestHeartRateBpm: 0,
-    weightKg: null as number | null,
-    bodyFatPercentage: null as number | null,
+    weightKg: null,
+    bodyFatPercentage: null,
     timestamp: 0,
-  } as TelemetryData,
-  blockedBundles: ["com.apple.tips"] as string[],
-  notificationHistory: [] as AncsNotificationLog[],
+  },
+  blockedBundles: ["com.apple.tips"],
+  notificationHistory: [],
 };
+
+function loadState(): BridgeState {
+  try {
+    if (existsSync(DATA_FILE)) {
+      const raw = readFileSync(DATA_FILE, "utf-8");
+      const parsed = JSON.parse(raw);
+      return { ...defaultState, ...parsed };
+    }
+  } catch (err) {
+    fastify.log.warn({ err }, "No se pudo cargar bridge-state.json, usando defaults");
+  }
+  return structuredClone(defaultState);
+}
+
+function saveState() {
+  try {
+    writeFileSync(DATA_FILE, JSON.stringify(bridgeState, null, 2), "utf-8");
+  } catch (err) {
+    fastify.log.error({ err }, "Error guardando bridge-state.json");
+  }
+}
+
+const bridgeState = loadState();
 
 const watchClients = new Set<SocketStream["socket"]>();
 const webClients = new Set<SocketStream["socket"]>();
@@ -128,6 +171,7 @@ function updateTelemetryState(data: TelemetryData) {
   bridgeState.watchStatus.watchBatteryPercent = data.watchBatteryPercent;
   bridgeState.watchStatus.isCharging = data.isCharging;
   bridgeState.watchStatus.lastSeen = Date.now();
+  saveState();
 
   broadcastToWeb({
     type: "TELEMETRY_UPDATED",
@@ -193,6 +237,7 @@ fastify.register(async (app) => {
               ...msg,
               lastSeen: Date.now(),
             };
+            saveState();
             broadcastToWeb({
               type: "WATCH_STATUS_UPDATED",
               data: bridgeState.watchStatus,
@@ -216,6 +261,7 @@ fastify.register(async (app) => {
               msg,
               ...bridgeState.notificationHistory.filter((n) => n.uid !== msg.uid),
             ].slice(0, 50);
+            saveState();
             broadcastToWeb({ type: "NEW_ANCS_NOTIFICATION", data: msg });
             break;
 
@@ -227,6 +273,7 @@ fastify.register(async (app) => {
 
           case "SYNC_CONFIG":
             bridgeState.blockedBundles = msg.blockedBundles;
+            saveState();
             broadcastToWatch(msg);
             broadcastToWeb({
               type: "CONFIG_UPDATED",
@@ -245,6 +292,7 @@ fastify.register(async (app) => {
       if (role === "watch" && watchClients.size === 0) {
         bridgeState.watchStatus.state = "SLEEP_OR_DISCONNECTED";
         bridgeState.watchStatus.stateLabel = "En reposo Doze / Sin WS activo";
+        saveState();
         broadcastToWeb({
           type: "WATCH_STATUS_UPDATED",
           data: bridgeState.watchStatus,

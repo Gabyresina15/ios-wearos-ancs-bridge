@@ -79,7 +79,9 @@ npm run dev
 # o docker-compose up --build desde la raíz
 ```
 
-Para producción ver [docs/DEPLOY.md](docs/DEPLOY.md).
+- CI: `.github/workflows/backend.yml` (build + typecheck + Docker)
+- Deploy one-click: `backend/railway.json`
+- Para producción ver [docs/DEPLOY.md](docs/DEPLOY.md).
 
 ## Web Companion
 
@@ -90,6 +92,6 @@ npm run dev
 # Configura VITE_WS_URL si el backend no está en localhost:8080
 ```
 
-Para producción (Vercel/Netlify) ver [docs/DEPLOY.md](docs/DEPLOY.md).
+Para producción (Vercel/Netlify) ver [docs/DEPLOY.md](docs/DEPLOY.md). Incluye `vercel.json`.
 
 El reloj se conecta automáticamente al WebSocket del backend para telemetría, filtros de Bundle ID y alertas remotas.

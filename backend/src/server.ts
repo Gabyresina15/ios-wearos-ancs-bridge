@@ -8,14 +8,36 @@ const fastify = Fastify({ logger: true });
 await fastify.register(cors, { origin: "*" });
 await fastify.register(websocket);
 
-// Esquemas de validación para mensajes entrantes
-const IncomingMessageSchema = z.discriminatedUnion("type", [
+const TelemetryPayloadSchema = z.object({
+  watchBatteryPercent: z.number().int().min(0).max(100),
+  isCharging: z.boolean(),
+  stepsToday: z.number().int().nonnegative(),
+  latestHeartRateBpm: z.number().int().nonnegative(),
+  weightKg: z.number().positive().nullable(),
+  bodyFatPercentage: z.number().min(0).max(100).nullable(),
+  timestamp: z.number(),
+});
+
+const IncomingWsMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("WATCH_STATUS"),
     state: z.string(),
     stateLabel: z.string(),
+    hfpConnected: z.boolean().optional().default(false),
+    watchBatteryPercent: z.number().int().min(0).max(100).optional().default(0),
+    isCharging: z.boolean().optional().default(false),
     deviceModel: z.string(),
     pairedIphone: z.string(),
+  }),
+  z.object({
+    type: z.literal("TELEMETRY_SYNC"),
+    watchBatteryPercent: z.number().int().min(0).max(100),
+    isCharging: z.boolean(),
+    stepsToday: z.number().int().nonnegative(),
+    latestHeartRateBpm: z.number().int().nonnegative(),
+    weightKg: z.number().positive().nullable(),
+    bodyFatPercentage: z.number().min(0).max(100).nullable(),
+    timestamp: z.number(),
   }),
   z.object({
     type: z.literal("ANCS_NOTIFICATION"),
@@ -49,39 +71,39 @@ const IncomingMessageSchema = z.discriminatedUnion("type", [
     ]),
   }),
   z.object({
-    type: z.literal("HEALTH_SYNC"),
-    stepsToday: z.number(),
-    latestHeartRateBpm: z.number(),
-    weightKg: z.number().nullable(),
-    bodyFatPercentage: z.number().nullable(),
-    timestamp: z.number(),
+    type: z.literal("REQUEST_TELEMETRY"),
   }),
 ]);
 
-type AncsNotificationLog = z.infer<typeof IncomingMessageSchema> & {
-  type: "ANCS_NOTIFICATION";
-};
+type AncsNotificationLog = Extract<
+  z.infer<typeof IncomingWsMessageSchema>,
+  { type: "ANCS_NOTIFICATION" }
+>;
 
-// Estado en memoria del puente
+type TelemetryData = z.infer<typeof TelemetryPayloadSchema>;
+
 const bridgeState = {
   watchStatus: {
     state: "DISCONNECTED",
     stateLabel: "Desconectado",
+    hfpConnected: false,
+    watchBatteryPercent: 0,
+    isCharging: false,
     deviceModel: "Galaxy Watch 6 Classic",
     pairedIphone: "iPhone 16 Pro Max",
     lastSeen: 0,
   },
+  telemetry: {
+    watchBatteryPercent: 0,
+    isCharging: false,
+    stepsToday: 0,
+    latestHeartRateBpm: 0,
+    weightKg: null as number | null,
+    bodyFatPercentage: null as number | null,
+    timestamp: 0,
+  } as TelemetryData,
   blockedBundles: ["com.apple.tips"] as string[],
   notificationHistory: [] as AncsNotificationLog[],
-};
-
-// Métricas de salud más recientes (para Apple Shortcuts / PWA)
-let latestHealthMetrics = {
-  stepsToday: 0,
-  latestHeartRateBpm: 0,
-  weightKg: null as number | null,
-  bodyFatPercentage: null as number | null,
-  timestamp: 0,
 };
 
 const watchClients = new Set<SocketStream["socket"]>();
@@ -101,16 +123,40 @@ function broadcastToWatch(payload: unknown) {
   }
 }
 
+function updateTelemetryState(data: TelemetryData) {
+  bridgeState.telemetry = data;
+  bridgeState.watchStatus.watchBatteryPercent = data.watchBatteryPercent;
+  bridgeState.watchStatus.isCharging = data.isCharging;
+  bridgeState.watchStatus.lastSeen = Date.now();
+
+  broadcastToWeb({
+    type: "TELEMETRY_UPDATED",
+    data: bridgeState.telemetry,
+  });
+}
+
 fastify.get("/health", async () => ({
   status: "ok",
-  watchConnected: watchClients.size > 0,
-  state: bridgeState.watchStatus,
-  health: latestHealthMetrics,
+  watchConnectedWs: watchClients.size > 0,
+  watchStatus: bridgeState.watchStatus,
+  telemetry: bridgeState.telemetry,
 }));
 
-// Endpoint para el Atajo de iOS (Apple Shortcuts) → Apple Health
-fastify.get("/api/health/latest", async () => {
-  return latestHealthMetrics;
+fastify.get("/api/telemetry/latest", async () => {
+  return bridgeState.telemetry;
+});
+
+fastify.post("/api/telemetry", async (request, reply) => {
+  const parsed = TelemetryPayloadSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.status(400).send({
+      error: "Invalid telemetry payload",
+      details: parsed.error.flatten(),
+    });
+  }
+
+  updateTelemetryState(parsed.data);
+  return reply.status(200).send({ ok: true, syncedAt: Date.now() });
 });
 
 fastify.register(async (app) => {
@@ -132,7 +178,6 @@ fastify.register(async (app) => {
         JSON.stringify({
           type: "INITIAL_SNAPSHOT",
           data: bridgeState,
-          health: latestHealthMetrics,
         })
       );
     }
@@ -140,7 +185,7 @@ fastify.register(async (app) => {
     connection.socket.on("message", (raw) => {
       try {
         const parsedJson = JSON.parse(raw.toString());
-        const msg = IncomingMessageSchema.parse(parsedJson);
+        const msg = IncomingWsMessageSchema.parse(parsedJson);
 
         switch (msg.type) {
           case "WATCH_STATUS":
@@ -148,7 +193,22 @@ fastify.register(async (app) => {
               ...msg,
               lastSeen: Date.now(),
             };
-            broadcastToWeb({ type: "WATCH_STATUS_UPDATED", data: bridgeState.watchStatus });
+            broadcastToWeb({
+              type: "WATCH_STATUS_UPDATED",
+              data: bridgeState.watchStatus,
+            });
+            break;
+
+          case "TELEMETRY_SYNC":
+            updateTelemetryState({
+              watchBatteryPercent: msg.watchBatteryPercent,
+              isCharging: msg.isCharging,
+              stepsToday: msg.stepsToday,
+              latestHeartRateBpm: msg.latestHeartRateBpm,
+              weightKg: msg.weightKg,
+              bodyFatPercentage: msg.bodyFatPercentage,
+              timestamp: msg.timestamp,
+            });
             break;
 
           case "ANCS_NOTIFICATION":
@@ -160,28 +220,18 @@ fastify.register(async (app) => {
             break;
 
           case "REMOTE_ALERT":
+          case "AMS_COMMAND":
+          case "REQUEST_TELEMETRY":
             broadcastToWatch(msg);
             break;
 
           case "SYNC_CONFIG":
             bridgeState.blockedBundles = msg.blockedBundles;
             broadcastToWatch(msg);
-            broadcastToWeb({ type: "CONFIG_UPDATED", blockedBundles: msg.blockedBundles });
-            break;
-
-          case "AMS_COMMAND":
-            broadcastToWatch(msg);
-            break;
-
-          case "HEALTH_SYNC":
-            latestHealthMetrics = {
-              stepsToday: msg.stepsToday,
-              latestHeartRateBpm: msg.latestHeartRateBpm,
-              weightKg: msg.weightKg,
-              bodyFatPercentage: msg.bodyFatPercentage,
-              timestamp: msg.timestamp,
-            };
-            broadcastToWeb({ type: "HEALTH_UPDATED", data: latestHealthMetrics });
+            broadcastToWeb({
+              type: "CONFIG_UPDATED",
+              blockedBundles: msg.blockedBundles,
+            });
             break;
         }
       } catch (err) {
@@ -193,9 +243,12 @@ fastify.register(async (app) => {
       watchClients.delete(connection.socket);
       webClients.delete(connection.socket);
       if (role === "watch" && watchClients.size === 0) {
-        bridgeState.watchStatus.state = "DISCONNECTED";
-        bridgeState.watchStatus.stateLabel = "Watch Offline (WS)";
-        broadcastToWeb({ type: "WATCH_STATUS_UPDATED", data: bridgeState.watchStatus });
+        bridgeState.watchStatus.state = "SLEEP_OR_DISCONNECTED";
+        bridgeState.watchStatus.stateLabel = "En reposo Doze / Sin WS activo";
+        broadcastToWeb({
+          type: "WATCH_STATUS_UPDATED",
+          data: bridgeState.watchStatus,
+        });
       }
     });
   });

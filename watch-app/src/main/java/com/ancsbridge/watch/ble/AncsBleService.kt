@@ -111,8 +111,10 @@ class AncsBleService : LifecycleService() {
                 val device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
                 val bondState = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.BOND_NONE)
                 if (device?.address == connectedIphone?.address && bondState == BluetoothDevice.BOND_BONDED) {
-                    saveTargetIphoneMac(device.address)
-                    hfpController.bindToIphone(device)
+                    device?.let { d ->
+                        saveTargetIphoneMac(d.address)
+                        hfpController.bindToIphone(d)
+                    }
                     activeGatt?.discoverServices()
                 }
             }
@@ -326,6 +328,7 @@ class AncsBleService : LifecycleService() {
             when (characteristic.uuid) {
                 AppleBleUuids.ANCS_NOTIFICATION_SOURCE -> handleNotificationSourceEvent(value)
                 AppleBleUuids.ANCS_DATA_SOURCE -> dataSourceCollector.onDataChunkReceived(value)
+                else -> {}
             }
         }
     }

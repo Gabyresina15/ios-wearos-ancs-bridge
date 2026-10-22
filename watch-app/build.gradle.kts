@@ -14,8 +14,8 @@ android {
         versionCode = 2
         versionName = "2.0.0"
 
-        buildConfigField("String", "WS_BACKEND_URL", "\"ws://192.168.100.136:8080/ws?role=watch\"")
-        buildConfigField("String", "HTTP_BACKEND_URL", "\"http://192.168.100.136:8080\"")
+        buildConfigField("String", "WS_BACKEND_URL", "\"wss://ios-wearos-ancs-bridge.onrender.com/ws?role=watch\"")
+        buildConfigField("String", "HTTP_BACKEND_URL", "\"https://ios-wearos-ancs-bridge.onrender.com\"")
     }
 
     buildFeatures {

@@ -3,7 +3,8 @@ import React, { useEffect, useRef, useState } from "react";
 interface WatchStatus {
   state: string;
   stateLabel: string;
-  hfpConnected: boolean;
+  hfpConnected?: boolean;
+  panConnected?: boolean;
   watchBatteryPercent: number;
   isCharging: boolean;
   deviceModel: string;
@@ -31,21 +32,35 @@ interface AncsNotification {
   timestamp: number;
 }
 
+const POPULAR_IOS_APPS = [
+  { name: "WhatsApp", bundleId: "net.whatsapp.WhatsApp", icon: "💬" },
+  { name: "Instagram", bundleId: "com.burbn.instagram", icon: "📸" },
+  { name: "Llamadas", bundleId: "com.apple.mobilephone", icon: "📞" },
+  { name: "iMessage / SMS", bundleId: "com.apple.MobileSMS", icon: "✉️" },
+  { name: "Telegram", bundleId: "ph.telegra.Telegraph", icon: "✈️" },
+  { name: "Gmail", bundleId: "com.google.Gmail", icon: "📧" },
+  { name: "Mercado Pago", bundleId: "com.mercadopago.MercadoPago", icon: "💳" },
+  { name: "Calendario", bundleId: "com.apple.mobilecal", icon: "📅" },
+];
+
 const WS_URL = import.meta.env.VITE_WS_URL || "ws://localhost:8080/ws?role=web";
 
 export default function App() {
   const wsRef = useRef<WebSocket | null>(null);
-  const [wsConnected, setWsConnected] = useState(false);
+  const [cloudConnected, setCloudConnected] = useState(false);
+  const [syncingPulse, setSyncingPulse] = useState(false);
+  const [activeTab, setActiveTab] = useState<"home" | "apps" | "inbox">("home");
+
   const [watchStatus, setWatchStatus] = useState<WatchStatus>({
     state: "DISCONNECTED",
     stateLabel: "Desconectado",
-    hfpConnected: false,
     watchBatteryPercent: 0,
     isCharging: false,
     deviceModel: "Galaxy Watch 6 Classic",
     pairedIphone: "iPhone 16 Pro Max",
     lastSeen: 0,
   });
+
   const [telemetry, setTelemetry] = useState<TelemetryData>({
     watchBatteryPercent: 0,
     isCharging: false,
@@ -55,11 +70,9 @@ export default function App() {
     bodyFatPercentage: null,
     timestamp: 0,
   });
+
   const [notifications, setNotifications] = useState<AncsNotification[]>([]);
   const [blockedBundles, setBlockedBundles] = useState<string[]>([]);
-  const [newBundleInput, setNewBundleInput] = useState("");
-  const [alertTitle, setAlertTitle] = useState("Alerta de Prueba");
-  const [alertMessage, setAlertMessage] = useState("Ping directo desde PWA al Galaxy Watch 6");
 
   useEffect(() => {
     let reconnectTimer: number;
@@ -67,9 +80,9 @@ export default function App() {
       const ws = new WebSocket(WS_URL);
       wsRef.current = ws;
 
-      ws.onopen = () => setWsConnected(true);
+      ws.onopen = () => setCloudConnected(true);
       ws.onclose = () => {
-        setWsConnected(false);
+        setCloudConnected(false);
         reconnectTimer = window.setTimeout(connect, 3000);
       };
 
@@ -78,18 +91,19 @@ export default function App() {
         if (payload.type === "INITIAL_SNAPSHOT") {
           setWatchStatus(payload.data.watchStatus);
           setTelemetry(payload.data.telemetry);
-          setNotifications(payload.data.notificationHistory);
-          setBlockedBundles(payload.data.blockedBundles);
+          setNotifications(payload.data.notificationHistory || []);
+          setBlockedBundles(payload.data.blockedBundles || []);
         } else if (payload.type === "WATCH_STATUS_UPDATED") {
           setWatchStatus(payload.data);
         } else if (payload.type === "TELEMETRY_UPDATED") {
           setTelemetry(payload.data);
+          setSyncingPulse(false);
         } else if (payload.type === "NEW_ANCS_NOTIFICATION") {
           setNotifications((prev) =>
             [payload.data, ...prev.filter((n) => n.uid !== payload.data.uid)].slice(0, 50)
           );
         } else if (payload.type === "CONFIG_UPDATED") {
-          setBlockedBundles(payload.blockedBundles);
+          setBlockedBundles(payload.blockedBundles || []);
         }
       };
     };
@@ -101,22 +115,23 @@ export default function App() {
     };
   }, []);
 
-  const sendTestAlert = (e: React.FormEvent) => {
-    e.preventDefault();
+  const syncWatchNow = () => {
+    setSyncingPulse(true);
+    wsRef.current?.send(JSON.stringify({ type: "REQUEST_TELEMETRY" }));
+    setTimeout(() => setSyncingPulse(false), 2500);
+  };
+
+  const findMyWatch = () => {
     wsRef.current?.send(
       JSON.stringify({
         type: "REMOTE_ALERT",
-        title: alertTitle,
-        message: alertMessage,
+        title: "Buscando tu reloj 🔔",
+        message: "Ping enviado desde tu iPhone 16 Pro Max",
       })
     );
   };
 
-  const requestTelemetry = () => {
-    wsRef.current?.send(JSON.stringify({ type: "REQUEST_TELEMETRY" }));
-  };
-
-  const toggleBlockBundle = (bundleId: string) => {
+  const toggleAppAllowed = (bundleId: string) => {
     const updated = blockedBundles.includes(bundleId)
       ? blockedBundles.filter((b) => b !== bundleId)
       : [...blockedBundles, bundleId];
@@ -133,228 +148,276 @@ export default function App() {
     wsRef.current?.send(JSON.stringify({ type: "AMS_COMMAND", command }));
   };
 
-  return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100 p-6 font-sans">
-      <div className="max-w-4xl mx-auto space-y-6">
-        {/* Header con Estado BLE y HFP */}
-        <header className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-zinc-900 border border-zinc-800 p-5 rounded-2xl">
-          <div>
-            <h1 className="text-xl font-bold tracking-tight">
-              GW6 Classic ⇄ iPhone 16 Pro Max Bridge
-            </h1>
-            <p className="text-xs text-zinc-400 mt-1">
-              ANCS + AMS + HFP (Llamadas) + Health Connect
-            </p>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <span
-              className={`px-3 py-1 rounded-full text-xs font-semibold ${
-                watchStatus.state === "READY"
-                  ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
-                  : "bg-amber-500/20 text-amber-400 border border-amber-500/30"
-              }`}
-            >
-              BLE: {watchStatus.stateLabel}
-            </span>
-            <span
-              className={`px-3 py-1 rounded-full text-xs font-semibold ${
-                watchStatus.hfpConnected
-                  ? "bg-indigo-500/20 text-indigo-400 border border-indigo-500/30"
-                  : "bg-zinc-800 text-zinc-400 border border-zinc-700"
-              }`}
-            >
-              HFP: {watchStatus.hfpConnected ? "Voz Activa" : "Standby"}
-            </span>
-            <span
-              className={`px-3 py-1 rounded-full text-xs font-semibold ${
-                wsConnected ? "bg-sky-500/20 text-sky-400" : "bg-red-500/20 text-red-400"
-              }`}
-            >
-              {wsConnected ? "WS Online" : "WS Offline"}
-            </span>
-          </div>
-        </header>
+  const isWatchOnline =
+    watchStatus.state === "READY" ||
+    (telemetry.timestamp > 0 && Date.now() - telemetry.timestamp < 30 * 60 * 1000);
 
-        {/* Tarjetas de Telemetría (Batería y Salud) */}
-        <section className="bg-zinc-900 border border-zinc-800 p-5 rounded-2xl space-y-4">
+  const batteryLevel = telemetry.watchBatteryPercent || watchStatus.watchBatteryPercent || 0;
+  const isCharging = telemetry.isCharging || watchStatus.isCharging;
+
+  return (
+    <div className="min-h-screen bg-black text-white font-sans pb-24 select-none">
+      <div className="max-w-md mx-auto px-5 pt-8 space-y-6">
+        <div className="bg-zinc-900/90 border border-zinc-800/80 rounded-3xl p-6 shadow-2xl">
           <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold uppercase tracking-wider text-zinc-400">
-              Telemetría y Salud del Reloj
-            </h2>
+            <div className="flex items-center gap-3.5">
+              <div className="w-12 h-12 rounded-2xl bg-zinc-800 flex items-center justify-center text-2xl shadow-inner">
+                ⌚
+              </div>
+              <div>
+                <h1 className="text-lg font-bold tracking-tight">Galaxy Watch 6</h1>
+                <div className="flex items-center gap-2 mt-0.5">
+                  <span
+                    className={`w-2 h-2 rounded-full ${
+                      isWatchOnline ? "bg-emerald-400" : "bg-amber-400 animate-pulse"
+                    }`}
+                  />
+                  <span className="text-xs text-zinc-400">
+                    {isWatchOnline
+                      ? "Conectado a tu iPhone"
+                      : cloudConnected
+                      ? "En espera / Ahorro"
+                      : "Reconectando..."}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div className="text-right">
+              <div className="flex items-center justify-end gap-1.5">
+                <span className="text-lg font-bold">{batteryLevel}%</span>
+                <span className="text-xs">{isCharging ? "⚡" : "🔋"}</span>
+              </div>
+              <div className="w-16 h-1.5 bg-zinc-800 rounded-full overflow-hidden mt-1 ml-auto">
+                <div
+                  className={`h-full rounded-full transition-all duration-500 ${
+                    batteryLevel > 20 ? "bg-emerald-400" : "bg-red-500"
+                  }`}
+                  style={{ width: `${Math.min(100, Math.max(5, batteryLevel))}%` }}
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3 mt-5 pt-4 border-t border-zinc-800/80">
             <button
-              onClick={requestTelemetry}
-              className="bg-zinc-800 hover:bg-zinc-700 text-xs px-3 py-1 rounded-lg transition"
+              onClick={syncWatchNow}
+              className="flex items-center justify-center gap-2 bg-zinc-800 hover:bg-zinc-700 active:scale-95 text-xs font-semibold py-2.5 px-4 rounded-2xl transition"
             >
-              Actualizar Ahora 🔄
+              <span className={syncingPulse ? "animate-spin" : ""}>🔄</span>
+              {syncingPulse ? "Sincronizando..." : "Actualizar datos"}
+            </button>
+            <button
+              onClick={findMyWatch}
+              className="flex items-center justify-center gap-2 bg-zinc-800 hover:bg-zinc-700 active:scale-95 text-xs font-semibold py-2.5 px-4 rounded-2xl transition"
+            >
+              <span>🔔</span> Hacer vibrar reloj
             </button>
           </div>
+        </div>
 
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-            <div className="bg-zinc-950 border border-zinc-800 p-3.5 rounded-xl">
-              <span className="text-xs text-zinc-400">Batería Reloj</span>
-              <p className="text-lg font-bold mt-1">
-                {telemetry.watchBatteryPercent}%{" "}
-                {telemetry.isCharging && <span className="text-emerald-400 text-xs">⚡ Carga</span>}
-              </p>
-            </div>
-            <div className="bg-zinc-950 border border-zinc-800 p-3.5 rounded-xl">
-              <span className="text-xs text-zinc-400">Pasos Hoy</span>
-              <p className="text-lg font-bold mt-1 text-emerald-400">
-                {telemetry.stepsToday.toLocaleString()} 👣
-              </p>
-            </div>
-            <div className="bg-zinc-950 border border-zinc-800 p-3.5 rounded-xl">
-              <span className="text-xs text-zinc-400">Frecuencia Cardíaca</span>
-              <p className="text-lg font-bold mt-1 text-rose-400">
-                {telemetry.latestHeartRateBpm} bpm ❤️
-              </p>
-            </div>
-            <div className="bg-zinc-950 border border-zinc-800 p-3.5 rounded-xl">
-              <span className="text-xs text-zinc-400">BIA (Peso / Grasa)</span>
-              <p className="text-sm font-bold mt-1 text-sky-400">
-                {telemetry.weightKg ? `${telemetry.weightKg} kg` : "--"} /{" "}
-                {telemetry.bodyFatPercentage ? `${telemetry.bodyFatPercentage}%` : "--"}
-              </p>
-            </div>
-          </div>
-        </section>
+        {activeTab === "home" && (
+          <>
+            <div className="space-y-3">
+              <div className="flex items-center justify-between px-1">
+                <h2 className="text-sm font-semibold text-zinc-400">Actividad y Salud</h2>
+                <a
+                  href="shortcuts://run-shortcut?name=Sync%20Watch%20Health"
+                  className="text-xs font-semibold text-emerald-400 hover:text-emerald-300"
+                >
+                  Enviar a Apple Health →
+                </a>
+              </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          {/* Emisor de Alertas y AMS */}
-          <section className="bg-zinc-900 border border-zinc-800 p-5 rounded-2xl space-y-4">
-            <h2 className="text-sm font-semibold uppercase tracking-wider text-zinc-400">
-              Disparo de Alerta & Control AMS
-            </h2>
-            <form onSubmit={sendTestAlert} className="space-y-3">
-              <input
-                type="text"
-                value={alertTitle}
-                onChange={(e) => setAlertTitle(e.target.value)}
-                placeholder="Título"
-                className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-sm"
-              />
-              <textarea
-                value={alertMessage}
-                onChange={(e) => setAlertMessage(e.target.value)}
-                placeholder="Mensaje"
-                rows={2}
-                className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-sm"
-              />
-              <button
-                type="submit"
-                className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-2 rounded-xl text-sm transition"
-              >
-                Enviar Alerta vía WebSocket al Reloj
-              </button>
-            </form>
+              <div className="grid grid-cols-2 gap-3.5">
+                <div className="bg-zinc-900/90 border border-zinc-800/80 p-4 rounded-3xl">
+                  <div className="flex items-center justify-between text-xs text-zinc-400">
+                    <span>Pasos hoy</span>
+                    <span>👣</span>
+                  </div>
+                  <p className="text-2xl font-bold mt-2 text-emerald-400">
+                    {telemetry.stepsToday.toLocaleString()}
+                  </p>
+                  <p className="text-[11px] text-zinc-500 mt-1">Meta diaria: 8,000</p>
+                </div>
 
-            <div className="pt-3 border-t border-zinc-800">
-              <p className="text-xs text-zinc-400 mb-2">Apple Media Service (AMS Proxy):</p>
-              <div className="grid grid-cols-3 gap-2">
+                <div className="bg-zinc-900/90 border border-zinc-800/80 p-4 rounded-3xl">
+                  <div className="flex items-center justify-between text-xs text-zinc-400">
+                    <span>Frecuencia</span>
+                    <span>❤️</span>
+                  </div>
+                  <p className="text-2xl font-bold mt-2 text-rose-400">
+                    {telemetry.latestHeartRateBpm || "--"}{" "}
+                    <span className="text-xs font-normal text-zinc-400">BPM</span>
+                  </p>
+                  <p className="text-[11px] text-zinc-500 mt-1">Última lectura</p>
+                </div>
+
+                <div className="bg-zinc-900/90 border border-zinc-800/80 p-4 rounded-3xl">
+                  <div className="flex items-center justify-between text-xs text-zinc-400">
+                    <span>Peso corporal</span>
+                    <span>⚖️</span>
+                  </div>
+                  <p className="text-2xl font-bold mt-2 text-sky-400">
+                    {telemetry.weightKg ? `${telemetry.weightKg.toFixed(1)}` : "--"}{" "}
+                    <span className="text-xs font-normal text-zinc-400">kg</span>
+                  </p>
+                  <p className="text-[11px] text-zinc-500 mt-1">Sensor reloj</p>
+                </div>
+
+                <div className="bg-zinc-900/90 border border-zinc-800/80 p-4 rounded-3xl">
+                  <div className="flex items-center justify-between text-xs text-zinc-400">
+                    <span>Grasa corporal</span>
+                    <span>⚡</span>
+                  </div>
+                  <p className="text-2xl font-bold mt-2 text-amber-400">
+                    {telemetry.bodyFatPercentage
+                      ? `${telemetry.bodyFatPercentage.toFixed(1)}`
+                      : "--"}{" "}
+                    <span className="text-xs font-normal text-zinc-400">%</span>
+                  </p>
+                  <p className="text-[11px] text-zinc-500 mt-1">Composición BIA</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="bg-zinc-900/90 border border-zinc-800/80 p-5 rounded-3xl space-y-3">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-zinc-400">Control Multimedia</span>
+                <span className="text-[11px] text-zinc-500">iPhone ⇄ Watch</span>
+              </div>
+              <div className="grid grid-cols-3 gap-3">
                 <button
                   onClick={() => sendMediaCommand("PREVIOUS_TRACK")}
-                  className="bg-zinc-800 hover:bg-zinc-700 py-2 rounded-lg text-xs"
+                  className="bg-zinc-800 hover:bg-zinc-700 active:scale-95 py-3 rounded-2xl text-sm font-medium transition"
                 >
-                  ⏮ Anterior
+                  ⏮
                 </button>
                 <button
                   onClick={() => sendMediaCommand("TOGGLE_PLAY_PAUSE")}
-                  className="bg-zinc-800 hover:bg-zinc-700 py-2 rounded-lg text-xs"
+                  className="bg-blue-600 hover:bg-blue-500 active:scale-95 py-3 rounded-2xl text-sm font-bold transition"
                 >
-                  ⏯ Play/Pause
+                  ⏯
                 </button>
                 <button
                   onClick={() => sendMediaCommand("NEXT_TRACK")}
-                  className="bg-zinc-800 hover:bg-zinc-700 py-2 rounded-lg text-xs"
+                  className="bg-zinc-800 hover:bg-zinc-700 active:scale-95 py-3 rounded-2xl text-sm font-medium transition"
                 >
-                  ⏭ Siguiente
+                  ⏭
                 </button>
               </div>
             </div>
-          </section>
+          </>
+        )}
 
-          {/* Filtro de Bundle IDs de iOS */}
-          <section className="bg-zinc-900 border border-zinc-800 p-5 rounded-2xl space-y-4">
-            <h2 className="text-sm font-semibold uppercase tracking-wider text-zinc-400">
-              Filtro de Bundle IDs (Lista Negra ANCS)
-            </h2>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={newBundleInput}
-                onChange={(e) => setNewBundleInput(e.target.value)}
-                placeholder="Ej. com.burbn.instagram"
-                className="flex-1 bg-zinc-950 border border-zinc-800 rounded-xl px-3 py-2 text-sm"
-              />
-              <button
-                onClick={() => {
-                  if (newBundleInput.trim()) {
-                    toggleBlockBundle(newBundleInput.trim());
-                    setNewBundleInput("");
-                  }
-                }}
-                className="bg-zinc-800 hover:bg-zinc-700 px-4 rounded-xl text-sm font-medium"
-              >
-                Bloquear
-              </button>
+        {activeTab === "apps" && (
+          <div className="bg-zinc-900/90 border border-zinc-800/80 rounded-3xl p-5 space-y-4">
+            <div>
+              <h2 className="text-base font-bold">Notificaciones en el Reloj</h2>
+              <p className="text-xs text-zinc-400 mt-0.5">
+                Elige qué aplicaciones de tu iPhone pueden vibrar en tu Galaxy Watch.
+              </p>
             </div>
-            <div className="flex flex-wrap gap-2">
-              {blockedBundles.map((bundle) => (
-                <span
-                  key={bundle}
-                  onClick={() => toggleBlockBundle(bundle)}
-                  className="cursor-pointer bg-red-500/15 border border-red-500/30 text-red-300 text-xs px-3 py-1 rounded-full"
-                >
-                  {bundle} ✕
-                </span>
-              ))}
-            </div>
-          </section>
-        </div>
 
-        {/* Stream de notificaciones ANCS en vivo */}
-        <section className="bg-zinc-900 border border-zinc-800 p-5 rounded-2xl space-y-3">
-          <h2 className="text-sm font-semibold uppercase tracking-wider text-zinc-400">
-            Stream de Notificaciones y Llamadas ANCS ({notifications.length})
-          </h2>
-          <div className="space-y-2 max-h-96 overflow-y-auto">
-            {notifications.map((n) => {
-              const isCall = n.appIdentifier === "com.apple.mobilephone";
-              return (
-                <div
-                  key={n.uid}
-                  className={`flex items-start justify-between border p-3 rounded-xl ${
-                    isCall
-                      ? "bg-emerald-950/20 border-emerald-500/30"
-                      : "bg-zinc-950 border-zinc-800/80"
-                  }`}
-                >
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <span
-                        className={`text-xs font-bold ${
-                          isCall ? "text-emerald-400" : "text-emerald-400"
+            <div className="divide-y divide-zinc-800/70">
+              {POPULAR_IOS_APPS.map((app) => {
+                const isEnabled = !blockedBundles.includes(app.bundleId);
+                return (
+                  <div
+                    key={app.bundleId}
+                    className="flex items-center justify-between py-3.5"
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className="text-xl">{app.icon}</span>
+                      <span className="text-sm font-medium">{app.name}</span>
+                    </div>
+                    <button
+                      onClick={() => toggleAppAllowed(app.bundleId)}
+                      className={`w-12 h-7 flex items-center rounded-full p-1 transition-colors ${
+                        isEnabled ? "bg-emerald-500" : "bg-zinc-700"
+                      }`}
+                    >
+                      <div
+                        className={`bg-white w-5 h-5 rounded-full shadow-md transform transition-transform ${
+                          isEnabled ? "translate-x-5" : "translate-x-0"
                         }`}
-                      >
+                      />
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {activeTab === "inbox" && (
+          <div className="bg-zinc-900/90 border border-zinc-800/80 rounded-3xl p-5 space-y-3">
+            <h2 className="text-base font-bold">Recientes en tu Reloj</h2>
+            {notifications.length === 0 ? (
+              <p className="text-xs text-zinc-500 py-8 text-center">
+                Aún no han entrado notificaciones recientes.
+              </p>
+            ) : (
+              <div className="space-y-2.5">
+                {notifications.map((n) => (
+                  <div
+                    key={n.uid}
+                    className="bg-zinc-950/80 border border-zinc-800/70 p-3.5 rounded-2xl flex items-start justify-between gap-3"
+                  >
+                    <div className="min-w-0">
+                      <span className="text-[11px] font-bold text-sky-400">
                         {n.appDisplayName}
                       </span>
-                      <span className="text-[11px] text-zinc-500 font-mono">({n.appIdentifier})</span>
+                      <p className="text-sm font-semibold truncate mt-0.5">{n.title}</p>
+                      <p className="text-xs text-zinc-400 line-clamp-2">
+                        {n.message || n.subtitle}
+                      </p>
                     </div>
-                    <p className="text-sm font-semibold mt-0.5">{n.title}</p>
-                    <p className="text-xs text-zinc-400">{n.message || n.subtitle}</p>
+                    <span className="text-[10px] text-zinc-500 shrink-0">
+                      {new Date(n.timestamp).toLocaleTimeString([], {
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
+                    </span>
                   </div>
-                  <button
-                    onClick={() => toggleBlockBundle(n.appIdentifier)}
-                    className="text-[11px] text-zinc-400 hover:text-red-400 border border-zinc-800 px-2 py-1 rounded-lg"
-                  >
-                    Silenciar App
-                  </button>
-                </div>
-              );
-            })}
+                ))}
+              </div>
+            )}
           </div>
-        </section>
+        )}
       </div>
+
+      <nav className="fixed bottom-0 inset-x-0 bg-zinc-950/90 backdrop-blur-md border-t border-zinc-800/80">
+        <div className="max-w-md mx-auto grid grid-cols-3 py-2.5">
+          <button
+            onClick={() => setActiveTab("home")}
+            className={`flex flex-col items-center gap-1 text-xs font-medium ${
+              activeTab === "home" ? "text-emerald-400" : "text-zinc-500"
+            }`}
+          >
+            <span className="text-lg">⌚</span>
+            <span>Mi Reloj</span>
+          </button>
+          <button
+            onClick={() => setActiveTab("apps")}
+            className={`flex flex-col items-center gap-1 text-xs font-medium ${
+              activeTab === "apps" ? "text-emerald-400" : "text-zinc-500"
+            }`}
+          >
+            <span className="text-lg">🔔</span>
+            <span>Apps</span>
+          </button>
+          <button
+            onClick={() => setActiveTab("inbox")}
+            className={`flex flex-col items-center gap-1 text-xs font-medium ${
+              activeTab === "inbox" ? "text-emerald-400" : "text-zinc-500"
+            }`}
+          >
+            <span className="text-lg">💬</span>
+            <span>Recientes</span>
+          </button>
+        </div>
+      </nav>
     </div>
   );
 }

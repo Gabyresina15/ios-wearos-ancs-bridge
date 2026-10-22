@@ -494,6 +494,7 @@ class AncsBleService : LifecycleService() {
                             AmsRemoteCommandId.entries.firstOrNull { it.name == cmd }?.let { sendAmsMediaCommand(it) }
                         }
                         "REQUEST_TELEMETRY" -> syncTelemetryNow()
+                        else -> {}
                     }
                 }
             }

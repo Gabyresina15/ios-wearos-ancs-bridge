@@ -11,20 +11,31 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.health.connect.client.PermissionController
 import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
 import androidx.wear.compose.foundation.lazy.items
 import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
 import androidx.wear.compose.material.*
 import com.ancsbridge.watch.ble.*
+import com.ancsbridge.watch.health.HealthConnectStatus
+import com.ancsbridge.watch.health.TelemetrySyncManager
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
@@ -32,7 +43,11 @@ class MainActivity : ComponentActivity() {
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-            bleService = (binder as? AncsBleService.LocalBinder)?.getService()
+            val service = (binder as? AncsBleService.LocalBinder)?.getService()
+            service?.setAutoReconnect(true)
+            service?.setAllowDndNotifications(true)
+            service?.setAutoPanInternet(true)
+            bleService = service
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -40,16 +55,23 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private val permissionLauncher = registerForActivityResult(
+    private val healthPermissionLauncher = registerForActivityResult(
+        PermissionController.createRequestPermissionResultContract()
+    ) {
+        bleService?.syncTelemetryNow()
+    }
+
+    private val runtimePermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
         startAndBindBleService()
+        requestHealthConnectPermissions()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        permissionLauncher.launch(
+        runtimePermissionLauncher.launch(
             arrayOf(
                 Manifest.permission.BLUETOOTH_SCAN,
                 Manifest.permission.BLUETOOTH_CONNECT,
@@ -64,8 +86,17 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             MaterialTheme {
-                WatchBridgeScreen(service = bleService)
+                CleanWatchScreen(
+                    service = bleService,
+                    onRequestHealthPermissions = { requestHealthConnectPermissions() }
+                )
             }
+        }
+    }
+
+    private fun requestHealthConnectPermissions() {
+        runCatching {
+            healthPermissionLauncher.launch(TelemetrySyncManager.REQUIRED_HEALTH_PERMISSIONS)
         }
     }
 
@@ -82,27 +113,24 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun WatchBridgeScreen(service: AncsBleService?) {
+fun CleanWatchScreen(
+    service: AncsBleService?,
+    onRequestHealthPermissions: () -> Unit
+) {
     val listState = rememberScalingLazyListState()
+    val timeFormatter = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
 
     val connState by service?.connectionState?.collectAsState()
         ?: remember { mutableStateOf(BleConnectionState.DISCONNECTED) }
-    val hfpConnected by service?.isHfpConnected?.collectAsState()
-        ?: remember { mutableStateOf(false) }
-    val panConnected by service?.isPanConnected?.collectAsState()
-        ?: remember { mutableStateOf(false) }
-    val autoPan by service?.autoPanEnabled?.collectAsState()
-        ?: remember { mutableStateOf(true) }
-    val allowDnd by service?.allowDndNotifications?.collectAsState()
-        ?: remember { mutableStateOf(true) }
-    val syncedTime by service?.syncedIphoneTime?.collectAsState()
-        ?: remember { mutableStateOf(null) }
-    val autoReconnect by service?.autoReconnect?.collectAsState()
-        ?: remember { mutableStateOf(true) }
+    val healthStatus by service?.healthStatus?.collectAsState()
+        ?: remember { mutableStateOf(HealthConnectStatus.UNKNOWN) }
     val telemetry by service?.latestTelemetry?.collectAsState()
         ?: remember { mutableStateOf(null) }
     val notifications by service?.notifications?.collectAsState()
         ?: remember { mutableStateOf(emptyList()) }
+
+    val isConnected = connState == BleConnectionState.READY
+    val incomingCall = notifications.firstOrNull { it.appIdentifier == "com.apple.mobilephone" }
 
     Scaffold(
         timeText = { TimeText() },
@@ -114,174 +142,240 @@ fun WatchBridgeScreen(service: AncsBleService?) {
                 .fillMaxSize()
                 .background(Color.Black),
             state = listState,
-            horizontalAlignment = Alignment.CenterHorizontally
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             item {
-                val badgeColor = when (connState) {
-                    BleConnectionState.READY -> Color(0xFF10B981)
-                    BleConnectionState.ADVERTISING,
-                    BleConnectionState.CONNECTING,
-                    BleConnectionState.BONDING -> Color(0xFFF59E0B)
-                    BleConnectionState.DISCONNECTED -> Color(0xFFEF4444)
-                }
-
-                Chip(
-                    onClick = { service?.startBleBridge() },
-                    modifier = Modifier.fillMaxWidth(0.92f),
-                    colors = ChipDefaults.primaryChipColors(backgroundColor = badgeColor),
-                    label = {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth(0.9f)
+                        .clip(RoundedCornerShape(24.dp))
+                        .background(Color(0xFF18181B))
+                        .clickable {
+                            service?.startBleBridge()
+                            service?.syncTelemetryNow()
+                        }
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .clip(CircleShape)
+                            .background(
+                                if (isConnected) Color(0xFF10B981) else Color(0xFFF59E0B)
+                            )
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Column(horizontalAlignment = Alignment.Start) {
                         Text(
-                            text = connState.label,
+                            text = "iPhone 16 Pro Max",
                             fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color.White,
+                            maxLines = 1
+                        )
+                        Text(
+                            text = if (isConnected) "Conectado" else "Conectando...",
+                            fontSize = 10.sp,
+                            color = if (isConnected) Color(0xFF10B981) else Color(0xFFA1A1AA)
+                        )
+                    }
+                }
+            }
+
+            if (incomingCall != null) {
+                item {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth(0.92f)
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(Color(0xFF064E3B))
+                            .padding(12.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            text = "Llamada entrante",
+                            fontSize = 10.sp,
+                            color = Color(0xFF6EE7B7)
+                        )
+                        Text(
+                            text = incomingCall.title,
+                            fontSize = 14.sp,
                             fontWeight = FontWeight.Bold,
+                            color = Color.White,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
-                    },
-                    secondaryLabel = {
-                        val hfpTag = if (hfpConnected) "HFP:OK" else "HFP:--"
-                        val panTag = if (panConnected) "NET:BT-PAN" else "NET:WiFi"
-                        Text("$hfpTag • $panTag", fontSize = 10.sp)
-                    }
-                )
-            }
-
-            item {
-                Chip(
-                    onClick = { service?.requestIphoneTimeSync() },
-                    modifier = Modifier.fillMaxWidth(0.92f),
-                    colors = ChipDefaults.secondaryChipColors(),
-                    label = {
-                        val timeStr = syncedTime?.formattedTime ?: "Sincronizar Hora BLE"
-                        Text("🕒 iPhone: $timeStr", fontSize = 11.sp)
-                    },
-                    secondaryLabel = {
-                        val status = when {
-                            syncedTime == null -> "Toca para leer CTS"
-                            syncedTime?.systemClockUpdated == true -> "Reloj ajustado"
-                            else -> "Desfase: ${syncedTime?.clockDriftMillis ?: 0} ms"
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceEvenly
+                        ) {
+                            Button(
+                                onClick = { service?.rejectOrDismissNotification(incomingCall) },
+                                modifier = Modifier.size(40.dp),
+                                colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFFEF4444))
+                            ) {
+                                Text("✕", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                            }
+                            Button(
+                                onClick = { service?.answerOrAcceptNotification(incomingCall) },
+                                modifier = Modifier.size(40.dp),
+                                colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF10B981))
+                            ) {
+                                Text("✓", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                            }
                         }
-                        Text(status, fontSize = 10.sp)
                     }
-                )
-            }
-
-            item {
-                Chip(
-                    onClick = { service?.syncTelemetryNow() },
-                    modifier = Modifier.fillMaxWidth(0.92f),
-                    colors = ChipDefaults.secondaryChipColors(),
-                    label = {
-                        val steps = telemetry?.stepsToday ?: 0L
-                        val hr = telemetry?.latestHeartRateBpm ?: 0L
-                        Text("👣 $steps pasos • ❤️ $hr bpm", fontSize = 11.sp)
-                    },
-                    secondaryLabel = {
-                        val weight = telemetry?.weightKg?.let { "${"%.1f".format(it)}kg" } ?: "--"
-                        val fat = telemetry?.bodyFatPercentage?.let { "${"%.1f".format(it)}%" } ?: "--"
-                        Text("BIA: $weight ($fat grasa) • Sync", fontSize = 10.sp)
-                    }
-                )
-            }
-
-            item {
-                ToggleChip(
-                    checked = autoPan,
-                    onCheckedChange = { service?.setAutoPanInternet(it) },
-                    modifier = Modifier.fillMaxWidth(0.92f),
-                    label = { Text("Internet BT-PAN", fontSize = 11.sp) },
-                    secondaryLabel = {
-                        Text(
-                            if (panConnected) "Conectado al Hotspot iOS" else "Requiere Hotspot en iOS",
-                            fontSize = 9.sp
-                        )
-                    },
-                    toggleControl = { Switch(checked = autoPan) }
-                )
-            }
-
-            item {
-                ToggleChip(
-                    checked = allowDnd,
-                    onCheckedChange = { service?.setAllowDndNotifications(it) },
-                    modifier = Modifier.fillMaxWidth(0.92f),
-                    label = { Text("Alertas en No Molestar 🌙", fontSize = 11.sp) },
-                    toggleControl = { Switch(checked = allowDnd) }
-                )
-            }
-
-            item {
-                ToggleChip(
-                    checked = autoReconnect,
-                    onCheckedChange = { service?.setAutoReconnect(it) },
-                    modifier = Modifier.fillMaxWidth(0.92f),
-                    label = { Text("Reconexión Low-Power", fontSize = 11.sp) },
-                    toggleControl = { Switch(checked = autoReconnect) }
-                )
+                }
             }
 
             item {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth(0.9f)
-                        .padding(vertical = 2.dp),
-                    horizontalArrangement = Arrangement.SpaceEvenly
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(Color(0xFF18181B))
+                        .padding(vertical = 6.dp, horizontal = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    CompactButton(onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.PREVIOUS_TRACK) }) {
-                        Text("⏮")
+                    CompactButton(
+                        onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.PREVIOUS_TRACK) },
+                        colors = ButtonDefaults.secondaryButtonColors(backgroundColor = Color(0xFF27272A))
+                    ) {
+                        Text("⏮", fontSize = 13.sp)
                     }
-                    CompactButton(onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.TOGGLE_PLAY_PAUSE) }) {
-                        Text("⏯")
+                    Button(
+                        onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.TOGGLE_PLAY_PAUSE) },
+                        modifier = Modifier.size(38.dp),
+                        colors = ButtonDefaults.primaryButtonColors(backgroundColor = Color(0xFF3B82F6))
+                    ) {
+                        Text("⏯", fontSize = 15.sp)
                     }
-                    CompactButton(onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.NEXT_TRACK) }) {
-                        Text("⏭")
+                    CompactButton(
+                        onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.NEXT_TRACK) },
+                        colors = ButtonDefaults.secondaryButtonColors(backgroundColor = Color(0xFF27272A))
+                    ) {
+                        Text("⏭", fontSize = 13.sp)
                     }
                 }
             }
 
-            items(notifications, key = { it.uid }) { item ->
-                val isCall = item.appIdentifier == "com.apple.mobilephone"
-                TitleCard(
-                    onClick = { service?.rejectOrDismissNotification(item) },
-                    title = {
-                        val dndIcon = if (item.receivedInDndMode) " 🌙" else ""
+            item {
+                val needsPermission = healthStatus == HealthConnectStatus.PERMISSIONS_MISSING
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth(0.9f)
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(Color(0xFF18181B))
+                        .clickable {
+                            if (needsPermission) onRequestHealthPermissions()
+                            else service?.syncTelemetryNow()
+                        }
+                        .padding(vertical = 10.dp, horizontal = 12.dp),
+                    horizontalArrangement = Arrangement.SpaceAround,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (needsPermission) {
                         Text(
-                            text = "${item.appDisplayName}$dndIcon • ${item.title}",
+                            text = "Toca para activar Salud ❤️",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = Color(0xFFFBBF24)
+                        )
+                    } else {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                text = "${telemetry?.stepsToday ?: 0}",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF34D399)
+                            )
+                            Text("Pasos", fontSize = 9.sp, color = Color(0xFFA1A1AA))
+                        }
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                text = "${telemetry?.latestHeartRateBpm ?: "--"}",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFFFB7185)
+                            )
+                            Text("BPM", fontSize = 9.sp, color = Color(0xFFA1A1AA))
+                        }
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            val weightText = telemetry?.weightKg?.let { "${"%.1f".format(it)}" } ?: "--"
+                            Text(
+                                text = weightText,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF38BDF8)
+                            )
+                            Text("Kg", fontSize = 9.sp, color = Color(0xFFA1A1AA))
+                        }
+                    }
+                }
+            }
+
+            if (notifications.isEmpty()) {
+                item {
+                    Text(
+                        text = "Todo al día",
+                        fontSize = 11.sp,
+                        color = Color(0xFF71717A),
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(top = 10.dp, bottom = 16.dp)
+                    )
+                }
+            } else {
+                items(notifications, key = { it.uid }) { item ->
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth(0.92f)
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(Color(0xFF18181B))
+                            .clickable { service?.rejectOrDismissNotification(item) }
+                            .padding(12.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = item.appDisplayName,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF38BDF8),
+                                maxLines = 1
+                            )
+                            Text(
+                                text = timeFormatter.format(Date(item.timestamp)),
+                                fontSize = 9.sp,
+                                color = Color(0xFF71717A)
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = item.title,
                             fontSize = 12.sp,
                             fontWeight = FontWeight.SemiBold,
-                            color = if (isCall) Color(0xFF34D399) else Color.White,
+                            color = Color.White,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
-                    },
-                    modifier = Modifier.fillMaxWidth(0.94f)
-                ) {
-                    Column {
-                        Text(
-                            text = item.message.ifEmpty { item.subtitle },
-                            fontSize = 11.sp,
-                            color = Color(0xFFD1D5DB),
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        if (isCall) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(top = 6.dp),
-                                horizontalArrangement = Arrangement.SpaceEvenly
-                            ) {
-                                CompactChip(
-                                    onClick = { service?.answerOrAcceptNotification(item) },
-                                    label = { Text("Contestar HFP", fontSize = 10.sp) },
-                                    colors = ChipDefaults.primaryChipColors(backgroundColor = Color(0xFF10B981))
-                                )
-                                CompactChip(
-                                    onClick = { service?.rejectOrDismissNotification(item) },
-                                    label = { Text("Cortar", fontSize = 10.sp) },
-                                    colors = ChipDefaults.primaryChipColors(backgroundColor = Color(0xFFEF4444))
-                                )
-                            }
+                        val body = item.message.ifEmpty { item.subtitle }
+                        if (body.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = body,
+                                fontSize = 11.sp,
+                                color = Color(0xFFD4D4D8),
+                                maxLines = 3,
+                                overflow = TextOverflow.Ellipsis
+                            )
                         }
                     }
                 }

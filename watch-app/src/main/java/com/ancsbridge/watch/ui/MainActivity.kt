@@ -89,6 +89,14 @@ fun WatchBridgeScreen(service: AncsBleService?) {
         ?: remember { mutableStateOf(BleConnectionState.DISCONNECTED) }
     val hfpConnected by service?.isHfpConnected?.collectAsState()
         ?: remember { mutableStateOf(false) }
+    val panConnected by service?.isPanConnected?.collectAsState()
+        ?: remember { mutableStateOf(false) }
+    val autoPan by service?.autoPanEnabled?.collectAsState()
+        ?: remember { mutableStateOf(true) }
+    val allowDnd by service?.allowDndNotifications?.collectAsState()
+        ?: remember { mutableStateOf(true) }
+    val syncedTime by service?.syncedIphoneTime?.collectAsState()
+        ?: remember { mutableStateOf(null) }
     val autoReconnect by service?.autoReconnect?.collectAsState()
         ?: remember { mutableStateOf(true) }
     val telemetry by service?.latestTelemetry?.collectAsState()
@@ -131,8 +139,29 @@ fun WatchBridgeScreen(service: AncsBleService?) {
                         )
                     },
                     secondaryLabel = {
-                        val hfpLabel = if (hfpConnected) "HFP Voz Activo" else "HFP En espera"
-                        Text("iPhone 16 • $hfpLabel", fontSize = 10.sp)
+                        val hfpTag = if (hfpConnected) "HFP:OK" else "HFP:--"
+                        val panTag = if (panConnected) "NET:BT-PAN" else "NET:WiFi"
+                        Text("$hfpTag • $panTag", fontSize = 10.sp)
+                    }
+                )
+            }
+
+            item {
+                Chip(
+                    onClick = { service?.requestIphoneTimeSync() },
+                    modifier = Modifier.fillMaxWidth(0.92f),
+                    colors = ChipDefaults.secondaryChipColors(),
+                    label = {
+                        val timeStr = syncedTime?.formattedTime ?: "Sincronizar Hora BLE"
+                        Text("🕒 iPhone: $timeStr", fontSize = 11.sp)
+                    },
+                    secondaryLabel = {
+                        val status = when {
+                            syncedTime == null -> "Toca para leer CTS"
+                            syncedTime?.systemClockUpdated == true -> "Reloj ajustado"
+                            else -> "Desfase: ${syncedTime?.clockDriftMillis ?: 0} ms"
+                        }
+                        Text(status, fontSize = 10.sp)
                     }
                 )
             }
@@ -152,6 +181,32 @@ fun WatchBridgeScreen(service: AncsBleService?) {
                         val fat = telemetry?.bodyFatPercentage?.let { "${"%.1f".format(it)}%" } ?: "--"
                         Text("BIA: $weight ($fat grasa) • Sync", fontSize = 10.sp)
                     }
+                )
+            }
+
+            item {
+                ToggleChip(
+                    checked = autoPan,
+                    onCheckedChange = { service?.setAutoPanInternet(it) },
+                    modifier = Modifier.fillMaxWidth(0.92f),
+                    label = { Text("Internet BT-PAN", fontSize = 11.sp) },
+                    secondaryLabel = {
+                        Text(
+                            if (panConnected) "Conectado al Hotspot iOS" else "Requiere Hotspot en iOS",
+                            fontSize = 9.sp
+                        )
+                    },
+                    toggleControl = { Switch(checked = autoPan) }
+                )
+            }
+
+            item {
+                ToggleChip(
+                    checked = allowDnd,
+                    onCheckedChange = { service?.setAllowDndNotifications(it) },
+                    modifier = Modifier.fillMaxWidth(0.92f),
+                    label = { Text("Alertas en No Molestar 🌙", fontSize = 11.sp) },
+                    toggleControl = { Switch(checked = allowDnd) }
                 )
             }
 
@@ -189,8 +244,9 @@ fun WatchBridgeScreen(service: AncsBleService?) {
                 TitleCard(
                     onClick = { service?.rejectOrDismissNotification(item) },
                     title = {
+                        val dndIcon = if (item.receivedInDndMode) " 🌙" else ""
                         Text(
-                            text = "${item.appDisplayName} • ${item.title}",
+                            text = "${item.appDisplayName}$dndIcon • ${item.title}",
                             fontSize = 12.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = if (isCall) Color(0xFF34D399) else Color.White,

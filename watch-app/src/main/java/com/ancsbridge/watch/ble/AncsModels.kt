@@ -1,23 +1,71 @@
 package com.ancsbridge.watch.ble
 
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.time.LocalDateTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.UUID
 
 object AppleBleUuids {
-    // Descriptor estándar de notificaciones BLE
     val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-
-    // Servicio genérico Heart Rate para visibilidad inmediata en Ajustes > Bluetooth de iOS
     val GENERIC_HEART_RATE_SERVICE: UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
 
-    // Apple Notification Center Service (ANCS)
+    // Current Time Service (CTS)
+    val CTS_SERVICE: UUID = UUID.fromString("00001805-0000-1000-8000-00805f9b34fb")
+    val CTS_CURRENT_TIME_CHAR: UUID = UUID.fromString("00002a2b-0000-1000-8000-00805f9b34fb")
+
+    // ANCS
     val ANCS_SERVICE: UUID = UUID.fromString("7905f431-b5ce-4e99-a40f-4b1e122d00d0")
     val ANCS_NOTIFICATION_SOURCE: UUID = UUID.fromString("9fbf120d-6301-42d9-8c58-25e699a21dbd")
     val ANCS_CONTROL_POINT: UUID = UUID.fromString("69d1d8f3-45e1-49a8-9821-9bbdfdaad9d9")
     val ANCS_DATA_SOURCE: UUID = UUID.fromString("22eac6e9-24d6-4bb5-be44-b36ace7c7bfb")
 
-    // Apple Media Service (AMS)
+    // AMS
     val AMS_SERVICE: UUID = UUID.fromString("89d3502b-0f36-433a-8ef4-c502ad55f8dc")
     val AMS_REMOTE_COMMAND: UUID = UUID.fromString("9b3c81d8-57b1-4a8a-b8df-0e56f7ca51c2")
+}
+
+data class SyncedIphoneTime(
+    val epochMillis: Long,
+    val formattedTime: String,
+    val clockDriftMillis: Long,
+    val systemClockUpdated: Boolean
+)
+
+object CtsTimeParser {
+    private val formatter = DateTimeFormatter.ofPattern("dd/MM HH:mm:ss")
+
+    fun parseCurrentTime(bytes: ByteArray): SyncedIphoneTime? {
+        if (bytes.size < 7) return null
+        return runCatching {
+            val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+            val year = buffer.short.toInt() and 0xFFFF
+            val month = buffer.get().toInt() and 0xFF
+            val day = buffer.get().toInt() and 0xFF
+            val hours = buffer.get().toInt() and 0xFF
+            val minutes = buffer.get().toInt() and 0xFF
+            val seconds = buffer.get().toInt() and 0xFF
+
+            val fraction256 = if (bytes.size >= 9) {
+                buffer.get() // skip DayOfWeek
+                buffer.get().toInt() and 0xFF
+            } else 0
+
+            val nanos = ((fraction256 / 256.0) * 1_000_000_000L).toInt()
+            val localDateTime = LocalDateTime.of(year, month, day, hours, minutes, seconds, nanos)
+            val zonedDateTime = localDateTime.atZone(ZoneId.systemDefault())
+            val iphoneEpochMillis = zonedDateTime.toInstant().toEpochMilli()
+            val drift = iphoneEpochMillis - System.currentTimeMillis()
+
+            SyncedIphoneTime(
+                epochMillis = iphoneEpochMillis,
+                formattedTime = localDateTime.format(formatter),
+                clockDriftMillis = drift,
+                systemClockUpdated = false
+            )
+        }.getOrNull()
+    }
 }
 
 enum class AncsEventId(val code: Byte) {
@@ -72,6 +120,7 @@ data class AncsNotificationHeader(
     val notificationUid: Int
 ) {
     val isSilent: Boolean get() = (eventFlags and 0x01) != 0
+    val isImportant: Boolean get() = (eventFlags and 0x02) != 0
     val isPreExisting: Boolean get() = (eventFlags and 0x04) != 0
     val hasPositiveAction: Boolean get() = (eventFlags and 0x08) != 0
     val hasNegativeAction: Boolean get() = (eventFlags and 0x10) != 0
@@ -84,6 +133,7 @@ data class AncsNotification(
     val title: String,
     val subtitle: String,
     val message: String,
+    val receivedInDndMode: Boolean = false,
     val timestamp: Long = System.currentTimeMillis()
 )
 

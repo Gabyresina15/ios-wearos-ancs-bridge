@@ -14,8 +14,8 @@ android {
         versionCode = 2
         versionName = "2.0.0"
 
-        buildConfigField("String", "WS_BACKEND_URL", "\"wss://tu-backend.up.railway.app/ws?role=watch\"")
-        buildConfigField("String", "HTTP_BACKEND_URL", "\"https://tu-backend.up.railway.app\"")
+        buildConfigField("String", "WS_BACKEND_URL", "\"ws://192.168.100.136:8080/ws?role=watch\"")
+        buildConfigField("String", "HTTP_BACKEND_URL", "\"http://192.168.100.136:8080\"")
     }
 
     buildFeatures {
@@ -38,20 +38,15 @@ android {
 }
 
 dependencies {
-    // Wear OS Compose
     implementation("androidx.wear.compose:compose-material:1.3.1")
     implementation("androidx.wear.compose:compose-foundation:1.3.1")
     implementation("androidx.activity:activity-compose:1.9.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.2")
     implementation("androidx.lifecycle:lifecycle-service:2.8.2")
 
-    // WorkManager para Doze Mode y sincronización periódica
     implementation("androidx.work:work-runtime-ktx:2.9.0")
-
-    // Health Connect
     implementation("androidx.health.connect:connect-client:1.1.0-alpha07")
 
-    // Coroutines & OkHttp
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }

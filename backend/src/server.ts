@@ -231,16 +231,16 @@ fastify.register(async (app) => {
     const role = query.role === "watch" ? "watch" : "web";
 
     if (role === "watch") {
-      watchClients.add(connection.socket);
-      connection.socket.send(
+      watchClients.add(connection);
+      connection.send(
         JSON.stringify({
           type: "SYNC_CONFIG",
           blockedBundles: bridgeState.blockedBundles,
         })
       );
     } else {
-      webClients.add(connection.socket);
-      connection.socket.send(
+      webClients.add(connection);
+      connection.send(
         JSON.stringify({
           type: "INITIAL_SNAPSHOT",
           data: bridgeState,
@@ -248,7 +248,7 @@ fastify.register(async (app) => {
       );
     }
 
-    connection.socket.on("message", (raw: any) => {
+    connection.on("message", (raw: any) => {
       try {
         const parsedJson = JSON.parse(raw.toString());
         const msg = IncomingWsMessageSchema.parse(parsedJson);
@@ -308,9 +308,9 @@ fastify.register(async (app) => {
       }
     });
 
-    connection.socket.on("close", () => {
-      watchClients.delete(connection.socket);
-      webClients.delete(connection.socket);
+    connection.on("close", () => {
+      watchClients.delete(connection);
+      webClients.delete(connection);
       if (role === "watch" && watchClients.size === 0) {
         bridgeState.watchStatus.state = "SLEEP_OR_DISCONNECTED";
         bridgeState.watchStatus.stateLabel = "En reposo Doze / Sin WS activo";

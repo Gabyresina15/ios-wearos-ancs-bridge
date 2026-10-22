@@ -6,21 +6,25 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.media.AudioManager
+import android.telecom.TelecomManager
 import android.util.Log
+import android.view.KeyEvent
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-@SuppressLint("MissingPermission", "PrivateApi")
-class HfpCallController(private val context: Context, private val adapter: BluetoothAdapter?) {
-
+@SuppressLint("MissingPermission")
+class HfpCallController(
+    private val context: Context,
+    private val adapter: BluetoothAdapter?
+) {
     companion object {
         private const val TAG = "HfpCallController"
         private const val PROFILE_HEADSET_CLIENT = 16
-        const val CALL_ACCEPT_NONE = 0
     }
 
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private val telecomManager = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager
     private var headsetClientProxy: BluetoothProfile? = null
     private var targetDevice: BluetoothDevice? = null
 
@@ -31,8 +35,7 @@ class HfpCallController(private val context: Context, private val adapter: Bluet
         override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
             if (profile == PROFILE_HEADSET_CLIENT) {
                 headsetClientProxy = proxy
-                Log.i(TAG, "Proxy BluetoothHeadsetClient (HFP) enlazado.")
-                targetDevice?.let { connectHfpProfile(it) }
+                refreshConnectionState()
             }
         }
 
@@ -50,72 +53,54 @@ class HfpCallController(private val context: Context, private val adapter: Bluet
 
     fun bindToIphone(device: BluetoothDevice) {
         targetDevice = device
-        connectHfpProfile(device)
+        refreshConnectionState()
     }
 
-    fun connectHfpProfile(device: BluetoothDevice) {
+    fun refreshConnectionState() {
         val proxy = headsetClientProxy ?: return
         runCatching {
-            val connectMethod = proxy.javaClass.getMethod("connect", BluetoothDevice::class.java)
-            val initiated = connectMethod.invoke(proxy, device) as? Boolean ?: false
-            val state = proxy.getConnectionState(device)
-            _isHfpConnected.value = (state == BluetoothProfile.STATE_CONNECTED) || initiated
-            Log.i(TAG, "Solicitud de conexión HFP a ${device.name}: initiated=$initiated, state=$state")
-        }.onFailure { err ->
-            Log.e(TAG, "No se pudo invocar connect() en BluetoothHeadsetClient", err)
+            val connectedDevices = proxy.connectedDevices
+            val device = targetDevice
+            _isHfpConnected.value = if (device != null) {
+                proxy.getConnectionState(device) == BluetoothProfile.STATE_CONNECTED ||
+                    connectedDevices.any { it.address == device.address }
+            } else {
+                connectedDevices.isNotEmpty()
+            }
         }
     }
 
     fun answerIncomingCall(): Boolean {
-        val proxy = headsetClientProxy ?: return false
-        val device = targetDevice ?: proxy.connectedDevices.firstOrNull() ?: return false
-
         return runCatching {
             enableWatchScoAudio()
-            val acceptMethod = proxy.javaClass.getMethod(
-                "acceptCall",
-                BluetoothDevice::class.java,
-                Int::class.javaPrimitiveType
-            )
-            acceptMethod.invoke(proxy, device, CALL_ACCEPT_NONE) as? Boolean ?: false
-        }.getOrElse { err ->
-            Log.e(TAG, "Error aceptando llamada por HFP", err)
-            false
+            @Suppress("DEPRECATION")
+            telecomManager.acceptRingingCall()
+            true
+        }.getOrElse {
+            dispatchHeadsetHookKey()
         }
     }
 
     fun rejectOrHangupCall(): Boolean {
-        val proxy = headsetClientProxy ?: return false
-        val device = targetDevice ?: proxy.connectedDevices.firstOrNull() ?: return false
-
         return runCatching {
-            val rejectMethod = proxy.javaClass.getMethod("rejectCall", BluetoothDevice::class.java)
-            val rejected = rejectMethod.invoke(proxy, device) as? Boolean ?: false
-            if (!rejected) {
-                val terminateMethod = proxy.javaClass.methods.find { it.name == "terminateCall" }
-                terminateMethod?.invoke(proxy, device, null)
-            }
+            @Suppress("DEPRECATION")
+            val ended = telecomManager.endCall()
             disableWatchScoAudio()
-            true
-        }.getOrElse { err ->
-            Log.e(TAG, "Error colgando llamada por HFP", err)
+            ended
+        }.getOrElse {
+            disableWatchScoAudio()
             false
         }
     }
 
-    fun dialNumber(phoneNumber: String): Boolean {
-        val proxy = headsetClientProxy ?: return false
-        val device = targetDevice ?: proxy.connectedDevices.firstOrNull() ?: return false
-
+    private fun dispatchHeadsetHookKey(): Boolean {
         return runCatching {
-            enableWatchScoAudio()
-            val dialMethod = proxy.javaClass.getMethod(
-                "dial",
-                BluetoothDevice::class.java,
-                String::class.java
-            )
-            dialMethod.invoke(proxy, device, phoneNumber) != null
-        }.getOrElse { false }
+            val down = KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_HEADSETHOOK)
+            val up = KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_HEADSETHOOK)
+            audioManager.dispatchMediaKeyEvent(down)
+            audioManager.dispatchMediaKeyEvent(up)
+            true
+        }.getOrDefault(false)
     }
 
     private fun enableWatchScoAudio() {

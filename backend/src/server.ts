@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import websocket, { SocketStream } from "@fastify/websocket";
+import websocket from "@fastify/websocket";
+import type { WebSocket } from "ws";
 import { z } from "zod";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -154,8 +155,8 @@ function saveState() {
 
 const bridgeState = loadState();
 
-const watchClients = new Set<SocketStream["socket"]>();
-const webClients = new Set<SocketStream["socket"]>();
+const watchClients = new Set<WebSocket>();
+const webClients = new Set<WebSocket>();
 
 function broadcastToWeb(payload: unknown) {
   const serialized = JSON.stringify(payload);
@@ -195,7 +196,6 @@ fastify.get("/api/telemetry/latest", async () => {
   return bridgeState.telemetry;
 });
 
-// Endpoint para Atajo iOS: solo los pasos nuevos desde la última consulta
 fastify.get("/api/health/consume-delta", async () => {
   const currentTotal = bridgeState.telemetry.stepsToday;
   const deltaSteps = Math.max(0, currentTotal - bridgeState.lastSyncedStepsTotal);
@@ -248,7 +248,7 @@ fastify.register(async (app) => {
       );
     }
 
-    connection.socket.on("message", (raw) => {
+    connection.socket.on("message", (raw: any) => {
       try {
         const parsedJson = JSON.parse(raw.toString());
         const msg = IncomingWsMessageSchema.parse(parsedJson);

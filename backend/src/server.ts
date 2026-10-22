@@ -28,6 +28,7 @@ const IncomingWsMessageSchema = z.discriminatedUnion("type", [
     state: z.string(),
     stateLabel: z.string(),
     hfpConnected: z.boolean().optional().default(false),
+    panConnected: z.boolean().optional().default(false),
     watchBatteryPercent: z.number().int().min(0).max(100).optional().default(0),
     isCharging: z.boolean().optional().default(false),
     deviceModel: z.string(),
@@ -91,6 +92,7 @@ interface BridgeState {
     state: string;
     stateLabel: string;
     hfpConnected: boolean;
+    panConnected: boolean;
     watchBatteryPercent: number;
     isCharging: boolean;
     deviceModel: string;
@@ -100,6 +102,7 @@ interface BridgeState {
   telemetry: TelemetryData;
   blockedBundles: string[];
   notificationHistory: AncsNotificationLog[];
+  lastSyncedStepsTotal: number;
 }
 
 const defaultState: BridgeState = {
@@ -107,6 +110,7 @@ const defaultState: BridgeState = {
     state: "DISCONNECTED",
     stateLabel: "Desconectado",
     hfpConnected: false,
+    panConnected: false,
     watchBatteryPercent: 0,
     isCharging: false,
     deviceModel: "Galaxy Watch 6 Classic",
@@ -124,6 +128,7 @@ const defaultState: BridgeState = {
   },
   blockedBundles: ["com.apple.tips"],
   notificationHistory: [],
+  lastSyncedStepsTotal: 0,
 };
 
 function loadState(): BridgeState {
@@ -188,6 +193,23 @@ fastify.get("/health", async () => ({
 
 fastify.get("/api/telemetry/latest", async () => {
   return bridgeState.telemetry;
+});
+
+// Endpoint para Atajo iOS: solo los pasos nuevos desde la última consulta
+fastify.get("/api/health/consume-delta", async () => {
+  const currentTotal = bridgeState.telemetry.stepsToday;
+  const deltaSteps = Math.max(0, currentTotal - bridgeState.lastSyncedStepsTotal);
+  bridgeState.lastSyncedStepsTotal = currentTotal;
+  saveState();
+
+  return {
+    stepsDelta: deltaSteps,
+    stepsTotalToday: currentTotal,
+    latestHeartRateBpm: bridgeState.telemetry.latestHeartRateBpm,
+    weightKg: bridgeState.telemetry.weightKg,
+    bodyFatPercentage: bridgeState.telemetry.bodyFatPercentage,
+    timestamp: Date.now(),
+  };
 });
 
 fastify.post("/api/telemetry", async (request, reply) => {

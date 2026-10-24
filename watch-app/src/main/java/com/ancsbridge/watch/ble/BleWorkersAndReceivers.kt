@@ -28,6 +28,18 @@ class BleReconnectWorker(appContext: Context, params: WorkerParameters) : Corout
     companion object {
         private const val WORK_NAME = "ble_reconnect_watchdog"
 
+        fun scheduleExponentialReconnect(context: Context, delaySeconds: Long) {
+            val request = OneTimeWorkRequestBuilder<BleReconnectWorker>()
+                .setInitialDelay(delaySeconds, TimeUnit.SECONDS)
+                .build()
+            WorkManager.getInstance(context).enqueue(request)
+        }
+
+        fun enqueueNetworkFlush(context: Context) {
+            val request = OneTimeWorkRequestBuilder<BleReconnectWorker>().build()
+            WorkManager.getInstance(context).enqueue(request)
+        }
+
         fun enqueuePeriodicWatchdog(context: Context) {
             val request = PeriodicWorkRequestBuilder<BleReconnectWorker>(15, TimeUnit.MINUTES)
                 .setConstraints(
@@ -75,6 +87,12 @@ class TelemetrySyncWorker(appContext: Context, params: WorkerParameters) : Corou
 }
 
 class BlePassiveScanReceiver : BroadcastReceiver() {
+    companion object {
+        fun scheduleDozeHeartbeatAlarm(context: Context, delayMinutes: Long) {
+            // Stub
+        }
+    }
+
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.action) {
             "com.ancsbridge.watch.ACTION_PASSIVE_BLE_FOUND" -> {

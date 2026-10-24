@@ -14,6 +14,7 @@ import com.google.common.util.concurrent.ListenableFuture
 class BridgeStatusTileService : TileService() {
 
     override fun onTileRequest(requestParams: RequestBuilders.TileRequest): ListenableFuture<TileBuilders.Tile> {
+        val deviceParams = requestParams.deviceConfiguration
         val tile = TileBuilders.Tile.Builder()
             .setResourcesVersion("1")
             .setTimeline(
@@ -23,7 +24,7 @@ class BridgeStatusTileService : TileService() {
                             .setLayout(
                                 androidx.wear.tiles.LayoutElementBuilders.Layout.Builder()
                                     .setRoot(
-                                        PrimaryLayout.Builder(deviceParameters)
+                                        PrimaryLayout.Builder(deviceParams)
                                             .setPrimaryLabelTextContent(
                                                 Text.Builder(this, "ANCS Bridge")
                                                     .setTypography(Typography.TYPOGRAPHY_TITLE3)

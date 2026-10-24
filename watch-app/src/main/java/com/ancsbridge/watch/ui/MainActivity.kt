@@ -122,6 +122,12 @@ fun CleanWatchScreen(
 
     val connState by service?.connectionState?.collectAsState()
         ?: remember { mutableStateOf(BleConnectionState.DISCONNECTED) }
+    val phoneName by service?.connectedDeviceName?.collectAsState()
+        ?: remember { mutableStateOf("Buscando iPhone...") }
+    val iphoneBattery by service?.iphoneBatteryPercent?.collectAsState()
+        ?: remember { mutableStateOf(null) }
+    val nowPlaying by service?.nowPlaying?.collectAsState()
+        ?: remember { mutableStateOf(NowPlayingState()) }
     val healthStatus by service?.healthStatus?.collectAsState()
         ?: remember { mutableStateOf(HealthConnectStatus.UNKNOWN) }
     val telemetry by service?.latestTelemetry?.collectAsState()
@@ -148,12 +154,11 @@ fun CleanWatchScreen(
             item {
                 Row(
                     modifier = Modifier
-                        .fillMaxWidth(0.9f)
+                        .fillMaxWidth(0.92f)
                         .clip(RoundedCornerShape(24.dp))
                         .background(Color(0xFF18181B))
                         .clickable {
-                            service?.startBleBridge()
-                            service?.syncTelemetryNow()
+                            service?.refreshConnectionOrReconnect()
                         }
                         .padding(horizontal = 14.dp, vertical = 10.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -170,14 +175,16 @@ fun CleanWatchScreen(
                     Spacer(modifier = Modifier.width(8.dp))
                     Column(horizontalAlignment = Alignment.Start) {
                         Text(
-                            text = "iPhone 16 Pro Max",
-                            fontSize = 12.sp,
+                            text = phoneName,
+                            fontSize = 11.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = Color.White,
-                            maxLines = 1
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
+                        val batteryBadge = iphoneBattery?.let { " • $it% 🔋" } ?: ""
                         Text(
-                            text = if (isConnected) "Conectado" else "Conectando...",
+                            text = connState.label + batteryBadge,
                             fontSize = 10.sp,
                             color = if (isConnected) Color(0xFF10B981) else Color(0xFFA1A1AA)
                         )
@@ -233,42 +240,104 @@ fun CleanWatchScreen(
             }
 
             item {
-                Row(
+                Column(
                     modifier = Modifier
-                        .fillMaxWidth(0.9f)
-                        .clip(RoundedCornerShape(20.dp))
+                        .fillMaxWidth(0.92f)
+                        .clip(RoundedCornerShape(22.dp))
                         .background(Color(0xFF18181B))
-                        .padding(vertical = 6.dp, horizontal = 8.dp),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                    verticalAlignment = Alignment.CenterVertically
+                        .padding(vertical = 8.dp, horizontal = 10.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    CompactButton(
-                        onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.PREVIOUS_TRACK) },
-                        colors = ButtonDefaults.secondaryButtonColors(backgroundColor = Color(0xFF27272A))
+                    Text(
+                        text = nowPlaying.title,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = nowPlaying.artist,
+                        fontSize = 10.sp,
+                        color = Color(0xFFA1A1AA),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("⏮", fontSize = 13.sp)
+                        CompactButton(
+                            onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.PREVIOUS_TRACK) },
+                            colors = ButtonDefaults.secondaryButtonColors(backgroundColor = Color(0xFF27272A))
+                        ) {
+                            Text("⏮", fontSize = 13.sp)
+                        }
+                        Button(
+                            onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.TOGGLE_PLAY_PAUSE) },
+                            modifier = Modifier.size(38.dp),
+                            colors = ButtonDefaults.primaryButtonColors(backgroundColor = Color(0xFF3B82F6))
+                        ) {
+                            Text(if (nowPlaying.isPlaying) "⏸" else "▶", fontSize = 15.sp)
+                        }
+                        CompactButton(
+                            onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.NEXT_TRACK) },
+                            colors = ButtonDefaults.secondaryButtonColors(backgroundColor = Color(0xFF27272A))
+                        ) {
+                            Text("⏭", fontSize = 13.sp)
+                        }
                     }
-                    Button(
-                        onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.TOGGLE_PLAY_PAUSE) },
-                        modifier = Modifier.size(38.dp),
-                        colors = ButtonDefaults.primaryButtonColors(backgroundColor = Color(0xFF3B82F6))
+                }
+            }
+
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(0.92f),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(Color(0xFF18181B))
+                            .clickable { service?.triggerCameraShutter() }
+                            .padding(vertical = 9.dp),
+                        contentAlignment = Alignment.Center
                     ) {
-                        Text("⏯", fontSize = 15.sp)
+                        Text(
+                            text = "📸 Cámara",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color.White
+                        )
                     }
-                    CompactButton(
-                        onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.NEXT_TRACK) },
-                        colors = ButtonDefaults.secondaryButtonColors(backgroundColor = Color(0xFF27272A))
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(Color(0xFF18181B))
+                            .clickable { service?.ringMyIphone() }
+                            .padding(vertical = 9.dp),
+                        contentAlignment = Alignment.Center
                     ) {
-                        Text("⏭", fontSize = 13.sp)
+                        Text(
+                            text = "🔊 Buscar",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = Color.White
+                        )
                     }
                 }
             }
 
             item {
                 val needsPermission = healthStatus == HealthConnectStatus.PERMISSIONS_MISSING
+                val hcUnavailable = healthStatus == HealthConnectStatus.UNAVAILABLE
                 Row(
                     modifier = Modifier
-                        .fillMaxWidth(0.9f)
+                        .fillMaxWidth(0.92f)
                         .clip(RoundedCornerShape(18.dp))
                         .background(Color(0xFF18181B))
                         .clickable {
@@ -279,41 +348,51 @@ fun CleanWatchScreen(
                     horizontalArrangement = Arrangement.SpaceAround,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    if (needsPermission) {
-                        Text(
-                            text = "Toca para activar Salud ❤️",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Medium,
-                            color = Color(0xFFFBBF24)
-                        )
-                    } else {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    when {
+                        needsPermission -> {
                             Text(
-                                text = "${telemetry?.stepsToday ?: 0}",
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color(0xFF34D399)
+                                text = "Autorizar permisos de Salud ❤️",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = Color(0xFFFBBF24)
                             )
-                            Text("Pasos", fontSize = 9.sp, color = Color(0xFFA1A1AA))
                         }
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        hcUnavailable -> {
                             Text(
-                                text = "${telemetry?.latestHeartRateBpm ?: "--"}",
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color(0xFFFB7185)
+                                text = "Health Connect no disponible",
+                                fontSize = 11.sp,
+                                color = Color(0xFFEF4444)
                             )
-                            Text("BPM", fontSize = 9.sp, color = Color(0xFFA1A1AA))
                         }
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            val weightText = telemetry?.weightKg?.let { "${"%.1f".format(it)}" } ?: "--"
-                            Text(
-                                text = weightText,
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color(0xFF38BDF8)
-                            )
-                            Text("Kg", fontSize = 9.sp, color = Color(0xFFA1A1AA))
+                        else -> {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    text = "${telemetry?.stepsToday ?: 0}",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFF34D399)
+                                )
+                                Text("Pasos", fontSize = 9.sp, color = Color(0xFFA1A1AA))
+                            }
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    text = "${telemetry?.latestHeartRateBpm ?: "--"}",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFFFB7185)
+                                )
+                                Text("BPM", fontSize = 9.sp, color = Color(0xFFA1A1AA))
+                            }
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                val weightText = telemetry?.weightKg?.let { "${"%.1f".format(it)}" } ?: "--"
+                                Text(
+                                    text = weightText,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFF38BDF8)
+                                )
+                                Text("Kg", fontSize = 9.sp, color = Color(0xFFA1A1AA))
+                            }
                         }
                     }
                 }
@@ -322,11 +401,11 @@ fun CleanWatchScreen(
             if (notifications.isEmpty()) {
                 item {
                     Text(
-                        text = "Todo al día",
+                        text = "Sin notificaciones nuevas",
                         fontSize = 11.sp,
                         color = Color(0xFF71717A),
                         textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(top = 10.dp, bottom = 16.dp)
+                        modifier = Modifier.padding(top = 8.dp, bottom = 16.dp)
                     )
                 }
             } else {

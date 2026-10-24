@@ -39,6 +39,9 @@ android {
 
 dependencies {
     implementation("androidx.wear.compose:compose-material:1.3.1")
+    implementation("androidx.wear.tiles:tiles:1.4.0")
+    implementation("androidx.wear.tiles:tiles-material:1.4.0")
+    implementation("com.google.guava:guava:32.1.3-android")
     implementation("androidx.wear.compose:compose-foundation:1.3.1")
     implementation("androidx.activity:activity-compose:1.9.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.2")

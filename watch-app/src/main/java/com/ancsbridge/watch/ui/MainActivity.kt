@@ -19,6 +19,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -135,6 +136,8 @@ fun CleanWatchScreen(
     val notifications by service?.notifications?.collectAsState()
         ?: remember { mutableStateOf(emptyList()) }
 
+    var notificationsMuted by remember { mutableStateOf(false) }
+
     val isConnected = connState == BleConnectionState.READY
     val incomingCall = notifications.firstOrNull { it.appIdentifier == "com.apple.mobilephone" }
 
@@ -146,47 +149,49 @@ fun CleanWatchScreen(
         ScalingLazyColumn(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color.Black),
+                .background(Color(0xFF0A0A0C)),
             state = listState,
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             item {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth(0.92f)
-                        .clip(RoundedCornerShape(24.dp))
-                        .background(Color(0xFF18181B))
-                        .clickable {
-                            service?.refreshConnectionOrReconnect()
-                        }
-                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                        .clip(RoundedCornerShape(28.dp))
+                        .background(
+                            Brush.horizontalGradient(
+                                listOf(Color(0xFF1A1A1F), Color(0xFF141418))
+                            )
+                        )
+                        .clickable { service?.refreshConnectionOrReconnect() }
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.Center
                 ) {
                     Box(
                         modifier = Modifier
-                            .size(8.dp)
+                            .size(10.dp)
                             .clip(CircleShape)
                             .background(
                                 if (isConnected) Color(0xFF10B981) else Color(0xFFF59E0B)
                             )
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
+                    Spacer(modifier = Modifier.width(10.dp))
                     Column(horizontalAlignment = Alignment.Start) {
                         Text(
                             text = phoneName,
-                            fontSize = 11.sp,
+                            fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = Color.White,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
-                        val batteryBadge = iphoneBattery?.let { " • $it% 🔋" } ?: ""
+                        val batteryBadge = iphoneBattery?.let { " • $it%" } ?: ""
                         Text(
                             text = connState.label + batteryBadge,
-                            fontSize = 10.sp,
-                            color = if (isConnected) Color(0xFF10B981) else Color(0xFFA1A1AA)
+                            fontSize = 11.sp,
+                            color = if (isConnected) Color(0xFF34D399) else Color(0xFFA1A1AA)
                         )
                     }
                 }
@@ -197,42 +202,42 @@ fun CleanWatchScreen(
                     Column(
                         modifier = Modifier
                             .fillMaxWidth(0.92f)
-                            .clip(RoundedCornerShape(20.dp))
+                            .clip(RoundedCornerShape(24.dp))
                             .background(Color(0xFF064E3B))
-                            .padding(12.dp),
+                            .padding(14.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Text(
                             text = "Llamada entrante",
-                            fontSize = 10.sp,
+                            fontSize = 11.sp,
                             color = Color(0xFF6EE7B7)
                         )
                         Text(
                             text = incomingCall.title,
-                            fontSize = 14.sp,
+                            fontSize = 15.sp,
                             fontWeight = FontWeight.Bold,
                             color = Color.White,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
-                        Spacer(modifier = Modifier.height(8.dp))
+                        Spacer(modifier = Modifier.height(10.dp))
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceEvenly
                         ) {
                             Button(
                                 onClick = { service?.rejectOrDismissNotification(incomingCall) },
-                                modifier = Modifier.size(40.dp),
+                                modifier = Modifier.size(44.dp),
                                 colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFFEF4444))
                             ) {
-                                Text("✕", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                                Text("✕", fontSize = 18.sp, fontWeight = FontWeight.Bold)
                             }
                             Button(
                                 onClick = { service?.answerOrAcceptNotification(incomingCall) },
-                                modifier = Modifier.size(40.dp),
+                                modifier = Modifier.size(44.dp),
                                 colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF10B981))
                             ) {
-                                Text("✓", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                                Text("✓", fontSize = 18.sp, fontWeight = FontWeight.Bold)
                             }
                         }
                     }
@@ -243,14 +248,18 @@ fun CleanWatchScreen(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth(0.92f)
-                        .clip(RoundedCornerShape(22.dp))
-                        .background(Color(0xFF18181B))
-                        .padding(vertical = 8.dp, horizontal = 10.dp),
+                        .clip(RoundedCornerShape(26.dp))
+                        .background(
+                            Brush.verticalGradient(
+                                listOf(Color(0xFF1E1E24), Color(0xFF16161A))
+                            )
+                        )
+                        .padding(vertical = 12.dp, horizontal = 12.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Text(
                         text = nowPlaying.title,
-                        fontSize = 12.sp,
+                        fontSize = 13.sp,
                         fontWeight = FontWeight.Bold,
                         color = Color.White,
                         maxLines = 1,
@@ -258,12 +267,12 @@ fun CleanWatchScreen(
                     )
                     Text(
                         text = nowPlaying.artist,
-                        fontSize = 10.sp,
+                        fontSize = 11.sp,
                         color = Color(0xFFA1A1AA),
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                    Spacer(modifier = Modifier.height(6.dp))
+                    Spacer(modifier = Modifier.height(10.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceEvenly,
@@ -273,21 +282,58 @@ fun CleanWatchScreen(
                             onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.PREVIOUS_TRACK) },
                             colors = ButtonDefaults.secondaryButtonColors(backgroundColor = Color(0xFF27272A))
                         ) {
-                            Text("⏮", fontSize = 13.sp)
+                            Text("⏮", fontSize = 16.sp, color = Color(0xFF38BDF8))
                         }
                         Button(
                             onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.TOGGLE_PLAY_PAUSE) },
-                            modifier = Modifier.size(38.dp),
-                            colors = ButtonDefaults.primaryButtonColors(backgroundColor = Color(0xFF3B82F6))
+                            modifier = Modifier.size(48.dp),
+                            colors = ButtonDefaults.primaryButtonColors(
+                                backgroundColor = if (nowPlaying.isPlaying) Color(0xFF10B981) else Color(0xFF3B82F6)
+                            )
                         ) {
-                            Text(if (nowPlaying.isPlaying) "⏸" else "▶", fontSize = 15.sp)
+                            Text(
+                                if (nowPlaying.isPlaying) "⏸" else "▶",
+                                fontSize = 18.sp,
+                                color = Color.White
+                            )
                         }
                         CompactButton(
                             onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.NEXT_TRACK) },
                             colors = ButtonDefaults.secondaryButtonColors(backgroundColor = Color(0xFF27272A))
                         ) {
-                            Text("⏭", fontSize = 13.sp)
+                            Text("⏭", fontSize = 16.sp, color = Color(0xFF38BDF8))
                         }
+                    }
+                }
+            }
+
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(0.92f),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = { service?.triggerCameraShutter() },
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(backgroundColor = Color(0xFF1E3A5F))
+                    ) {
+                        Text("Cámara", fontSize = 11.sp, color = Color(0xFF7DD3FC))
+                    }
+                    Button(
+                        onClick = {
+                            notificationsMuted = !notificationsMuted
+                            service?.setAllowDndNotifications(!notificationsMuted)
+                        },
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(
+                            backgroundColor = if (notificationsMuted) Color(0xFF7F1D1D) else Color(0xFF1E3A5F)
+                        )
+                    ) {
+                        Text(
+                            if (notificationsMuted) "Silenciado" else "Silenciar",
+                            fontSize = 11.sp,
+                            color = if (notificationsMuted) Color(0xFFFCA5A5) else Color(0xFF7DD3FC)
+                        )
                     }
                 }
             }
@@ -298,21 +344,21 @@ fun CleanWatchScreen(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth(0.92f)
-                        .clip(RoundedCornerShape(18.dp))
-                        .background(Color(0xFF18181B))
+                        .clip(RoundedCornerShape(22.dp))
+                        .background(Color(0xFF1A1A1F))
                         .clickable {
                             if (needsPermission) onRequestHealthPermissions()
                             else service?.syncTelemetryNow()
                         }
-                        .padding(vertical = 10.dp, horizontal = 12.dp),
+                        .padding(vertical = 12.dp, horizontal = 14.dp),
                     horizontalArrangement = Arrangement.SpaceAround,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     when {
                         needsPermission -> {
                             Text(
-                                text = "Autorizar permisos de Salud ❤️",
-                                fontSize = 11.sp,
+                                text = "Autorizar Salud",
+                                fontSize = 12.sp,
                                 fontWeight = FontWeight.Medium,
                                 color = Color(0xFFFBBF24)
                             )
@@ -328,30 +374,30 @@ fun CleanWatchScreen(
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 Text(
                                     text = "${telemetry?.stepsToday ?: 0}",
-                                    fontSize = 13.sp,
+                                    fontSize = 14.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = Color(0xFF34D399)
                                 )
-                                Text("Pasos", fontSize = 9.sp, color = Color(0xFFA1A1AA))
+                                Text("Pasos", fontSize = 10.sp, color = Color(0xFFA1A1AA))
                             }
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 Text(
                                     text = "${telemetry?.latestHeartRateBpm ?: "--"}",
-                                    fontSize = 13.sp,
+                                    fontSize = 14.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = Color(0xFFFB7185)
                                 )
-                                Text("BPM", fontSize = 9.sp, color = Color(0xFFA1A1AA))
+                                Text("BPM", fontSize = 10.sp, color = Color(0xFFA1A1AA))
                             }
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 val weightText = telemetry?.weightKg?.let { "${"%.1f".format(it)}" } ?: "--"
                                 Text(
                                     text = weightText,
-                                    fontSize = 13.sp,
+                                    fontSize = 14.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = Color(0xFF38BDF8)
                                 )
-                                Text("Kg", fontSize = 9.sp, color = Color(0xFFA1A1AA))
+                                Text("Kg", fontSize = 10.sp, color = Color(0xFFA1A1AA))
                             }
                         }
                     }
@@ -362,10 +408,10 @@ fun CleanWatchScreen(
                 item {
                     Text(
                         text = "Sin notificaciones nuevas",
-                        fontSize = 11.sp,
+                        fontSize = 12.sp,
                         color = Color(0xFF71717A),
                         textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(top = 8.dp, bottom = 16.dp)
+                        modifier = Modifier.padding(top = 12.dp, bottom = 20.dp)
                     )
                 }
             } else {
@@ -373,10 +419,10 @@ fun CleanWatchScreen(
                     Column(
                         modifier = Modifier
                             .fillMaxWidth(0.92f)
-                            .clip(RoundedCornerShape(18.dp))
-                            .background(Color(0xFF18181B))
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(Color(0xFF1A1A1F))
                             .clickable { service?.rejectOrDismissNotification(item) }
-                            .padding(12.dp)
+                            .padding(14.dp)
                     ) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -385,21 +431,21 @@ fun CleanWatchScreen(
                         ) {
                             Text(
                                 text = item.appDisplayName,
-                                fontSize = 10.sp,
+                                fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
                                 color = Color(0xFF38BDF8),
                                 maxLines = 1
                             )
                             Text(
                                 text = timeFormatter.format(Date(item.timestamp)),
-                                fontSize = 9.sp,
+                                fontSize = 10.sp,
                                 color = Color(0xFF71717A)
                             )
                         }
-                        Spacer(modifier = Modifier.height(2.dp))
+                        Spacer(modifier = Modifier.height(4.dp))
                         Text(
                             text = item.title,
-                            fontSize = 12.sp,
+                            fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = Color.White,
                             maxLines = 1,
@@ -407,10 +453,10 @@ fun CleanWatchScreen(
                         )
                         val body = item.message.ifEmpty { item.subtitle }
                         if (body.isNotEmpty()) {
-                            Spacer(modifier = Modifier.height(2.dp))
+                            Spacer(modifier = Modifier.height(3.dp))
                             Text(
                                 text = body,
-                                fontSize = 11.sp,
+                                fontSize = 12.sp,
                                 color = Color(0xFFD4D4D8),
                                 maxLines = 3,
                                 overflow = TextOverflow.Ellipsis

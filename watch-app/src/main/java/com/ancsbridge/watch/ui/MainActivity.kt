@@ -293,46 +293,6 @@ fun CleanWatchScreen(
             }
 
             item {
-                Row(
-                    modifier = Modifier.fillMaxWidth(0.92f),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(Color(0xFF18181B))
-                            .clickable { service?.triggerCameraShutter() }
-                            .padding(vertical = 9.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = "📸 Cámara",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = Color.White
-                        )
-                    }
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .clip(RoundedCornerShape(16.dp))
-                            .background(Color(0xFF18181B))
-                            .clickable { service?.ringMyIphone() }
-                            .padding(vertical = 9.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = "🔊 Buscar",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = Color.White
-                        )
-                    }
-                }
-            }
-
-            item {
                 val needsPermission = healthStatus == HealthConnectStatus.PERMISSIONS_MISSING
                 val hcUnavailable = healthStatus == HealthConnectStatus.UNAVAILABLE
                 Row(

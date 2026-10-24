@@ -65,16 +65,6 @@
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
 
-        <service
-            android:name=".tile.BridgeStatusTileService"
-            android:exported="true"
-            android:label="ANCS Bridge"
-            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
-            <intent-filter>
-                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
-            </intent-filter>
-        </service>
-
         <receiver
             android:name=".ble.BlePassiveScanReceiver"
             android:exported="true">

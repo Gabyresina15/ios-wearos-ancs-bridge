@@ -1,0 +1,78 @@
+name: Build Native WearOS & iOS Apps
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Compilar APK de Reloj Wear OS (watch-app)
+  # ---------------------------------------------------------------------------
+  build-wearos:
+    name: Wear OS Watch APK (Galaxy Watch 6 Classic)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Build Wear OS Debug APK
+        working-directory: ./watch-app
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Upload Wear OS APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: watch-app-debug-apk
+          path: watch-app/build/outputs/apk/debug/watch-app-debug.apk
+
+  # ---------------------------------------------------------------------------
+  # 2. Compilar IPA Nativo de iOS (ios-app) para Sideloadly / AltStore
+  # ---------------------------------------------------------------------------
+  build-ios:
+    name: iOS Native IPA (iPhone 16 Pro Max)
+    runs-on: macos-14
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode Project & Compile Unsigned .app
+        working-directory: ./ios-app
+        run: |
+          xcodegen generate
+          xcodebuild clean build \
+            -project AncsBridgeIOS.xcodeproj \
+            -scheme AncsBridgeIOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package .ipa for Sideloadly / AltStore
+        working-directory: ./ios-app
+        run: |
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/AncsBridgeIOS.app Payload/
+          zip -r9 AncsBridgeIOS-unsigned.ipa Payload
+
+      - name: Upload iOS Unsigned IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-companion-unsigned-ipa
+          path: ios-app/AncsBridgeIOS-unsigned.ipa

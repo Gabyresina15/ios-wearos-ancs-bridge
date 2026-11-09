@@ -1,98 +1,93 @@
 package com.ancsbridge.watch.health
 
 import android.content.Context
-import androidx.health.connect.client.HealthConnectClient
-import androidx.health.connect.client.records.BodyFatRecord
-import androidx.health.connect.client.records.HeartRateRecord
-import androidx.health.connect.client.records.StepsRecord
-import androidx.health.connect.client.records.WeightRecord
-import androidx.health.connect.client.request.ReadRecordsRequest
-import androidx.health.connect.client.time.TimeRangeFilter
-import org.json.JSONObject
-import java.time.Instant
-import java.time.ZonedDateTime
-import java.time.temporal.ChronoUnit
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import java.time.LocalDate
 
-data class WatchHealthSnapshot(
-    val stepsToday: Long,
-    val latestHeartRateBpm: Long,
-    val weightKg: Double?,
-    val bodyFatPercentage: Double?,
-    val timestamp: Long = System.currentTimeMillis()
-)
+/**
+ * Monitor directo de sensores de hardware del Galaxy Watch 6 (TYPE_STEP_COUNTER y TYPE_HEART_RATE).
+ * Garantiza lecturas reales de pasos y frecuencia cardíaca en tiempo real incluso cuando
+ * Health Connect no está instalado o configurado en un reloj vinculado a iOS.
+ */
+class HardwareSensorMonitor(context: Context) : SensorEventListener {
 
-class HealthSyncManager(private val context: Context) {
-
-    private val healthConnectClient by lazy { HealthConnectClient.getOrCreate(context) }
-
-    /**
-     * Extrae el total de pasos del día, última FC, último peso y último % de grasa corporal (BIA)
-     * registrados por Samsung Health en el Galaxy Watch 6 Classic.
-     */
-    suspend fun collectDailyHealthSnapshot(): WatchHealthSnapshot {
-        val now = Instant.now()
-        val startOfDay = ZonedDateTime.now().truncatedTo(ChronoUnit.DAYS).toInstant()
-        val last30Days = now.minus(30, ChronoUnit.DAYS)
-
-        // 1. Pasos acumulados hoy
-        val stepsResponse = healthConnectClient.readRecords(
-            ReadRecordsRequest(
-                recordType = StepsRecord::class,
-                timeRangeFilter = TimeRangeFilter.between(startOfDay, now)
-            )
-        )
-        val totalSteps = stepsResponse.records.sumOf { it.count }
-
-        // 2. Última frecuencia cardíaca
-        val hrResponse = healthConnectClient.readRecords(
-            ReadRecordsRequest(
-                recordType = HeartRateRecord::class,
-                timeRangeFilter = TimeRangeFilter.between(startOfDay, now)
-            )
-        )
-        val latestHr = hrResponse.records
-            .flatMap { it.samples }
-            .maxByOrNull { it.time }
-            ?.beatsPerMinute ?: 0L
-
-        // 3. Último Peso registrado (en Kg)
-        val weightResponse = healthConnectClient.readRecords(
-            ReadRecordsRequest(
-                recordType = WeightRecord::class,
-                timeRangeFilter = TimeRangeFilter.between(last30Days, now)
-            )
-        )
-        val latestWeightKg = weightResponse.records
-            .maxByOrNull { it.time }
-            ?.weight?.inKilograms
-
-        // 4. Último Porcentaje de Grasa Corporal (sensor BIA del Galaxy Watch 6)
-        val bodyFatResponse = healthConnectClient.readRecords(
-            ReadRecordsRequest(
-                recordType = BodyFatRecord::class,
-                timeRangeFilter = TimeRangeFilter.between(last30Days, now)
-            )
-        )
-        val latestBodyFatPct = bodyFatResponse.records
-            .maxByOrNull { it.time }
-            ?.percentage?.value
-
-        return WatchHealthSnapshot(
-            stepsToday = totalSteps,
-            latestHeartRateBpm = latestHr,
-            weightKg = latestWeightKg,
-            bodyFatPercentage = latestBodyFatPct
-        )
+    companion object {
+        private const val PREFS_NAME = "watch_hw_sensors_prefs"
+        private const val KEY_DATE_ISO = "step_baseline_date"
+        private const val KEY_BASELINE_COUNT = "step_baseline_raw"
+        private const val KEY_CACHED_TODAY_STEPS = "step_cached_today"
+        private const val KEY_CACHED_HR_BPM = "hr_cached_bpm"
     }
 
-    fun toWebSocketPayload(snapshot: WatchHealthSnapshot): String {
-        return JSONObject().apply {
-            put("type", "HEALTH_SYNC")
-            put("stepsToday", snapshot.stepsToday)
-            put("latestHeartRateBpm", snapshot.latestHeartRateBpm)
-            put("weightKg", snapshot.weightKg ?: JSONObject.NULL)
-            put("bodyFatPercentage", snapshot.bodyFatPercentage ?: JSONObject.NULL)
-            put("timestamp", snapshot.timestamp)
-        }.toString()
+    private val appContext = context.applicationContext
+    private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val sensorManager = appContext.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
+
+    @Volatile
+    var stepsToday: Long = prefs.getLong(KEY_CACHED_TODAY_STEPS, 0L)
+        private set
+
+    @Volatile
+    var latestHeartRateBpm: Long = prefs.getLong(KEY_CACHED_HR_BPM, 0L)
+        private set
+
+    private var isListening = false
+
+    fun startListening() {
+        if (isListening) return
+        val sm = sensorManager ?: return
+        isListening = true
+
+        sm.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)?.let { stepSensor ->
+            sm.registerListener(this, stepSensor, SensorManager.SENSOR_DELAY_NORMAL)
+        }
+        sm.getDefaultSensor(Sensor.TYPE_HEART_RATE)?.let { hrSensor ->
+            sm.registerListener(this, hrSensor, SensorManager.SENSOR_DELAY_NORMAL)
+        }
     }
+
+    fun stopListening() {
+        if (!isListening) return
+        sensorManager?.unregisterListener(this)
+        isListening = false
+    }
+
+    override fun onSensorChanged(event: SensorEvent?) {
+        val ev = event ?: return
+        when (ev.sensor.type) {
+            Sensor.TYPE_STEP_COUNTER -> {
+                val totalSinceBoot = ev.values.firstOrNull()?.toLong() ?: return
+                if (totalSinceBoot < 0L) return
+
+                val todayIso = LocalDate.now().toString()
+                val savedDate = prefs.getString(KEY_DATE_ISO, null)
+                var baseline = prefs.getLong(KEY_BASELINE_COUNT, -1L)
+
+                if (savedDate != todayIso || baseline < 0L || totalSinceBoot < baseline) {
+                    baseline = totalSinceBoot
+                    prefs.edit()
+                        .putString(KEY_DATE_ISO, todayIso)
+                        .putLong(KEY_BASELINE_COUNT, baseline)
+                        .apply()
+                }
+
+                val computedSteps = (totalSinceBoot - baseline).coerceAtLeast(0L)
+                stepsToday = computedSteps
+                prefs.edit().putLong(KEY_CACHED_TODAY_STEPS, computedSteps).apply()
+            }
+
+            Sensor.TYPE_HEART_RATE -> {
+                val bpm = ev.values.firstOrNull()?.toLong() ?: return
+                if (bpm in 30L..240L) {
+                    latestHeartRateBpm = bpm
+                    prefs.edit().putLong(KEY_CACHED_HR_BPM, bpm).apply()
+                }
+            }
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 }

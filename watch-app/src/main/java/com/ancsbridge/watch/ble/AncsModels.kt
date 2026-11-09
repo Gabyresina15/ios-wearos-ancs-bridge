@@ -33,6 +33,12 @@ object AppleBleUuids {
     val AMS_SERVICE: UUID = UUID.fromString("89d3502b-0f36-433a-8ef4-c502ad55f8dc")
     val AMS_REMOTE_COMMAND: UUID = UUID.fromString("9b3c81d8-57b1-4a8a-b8df-0e56f7ca51c2")
     val AMS_ENTITY_UPDATE: UUID = UUID.fromString("2f7cabce-808d-411f-9a0c-bb92ba96c102")
+
+    // Canal BLE GATT nativo directo (Reloj <-> App Nativa iOS sin servidor cloud)
+    val BRIDGE_SYNC_SERVICE: UUID = UUID.fromString("d973f2e0-b19e-11e2-9e96-0800200c9a66")
+    val BRIDGE_TELEMETRY_CHAR: UUID = UUID.fromString("d973f2e1-b19e-11e2-9e96-0800200c9a66")
+    val BRIDGE_COMMAND_CONFIG_CHAR: UUID = UUID.fromString("d973f2e2-b19e-11e2-9e96-0800200c9a66")
+    val BRIDGE_WATCH_EVENT_CHAR: UUID = UUID.fromString("d973f2e3-b19e-11e2-9e96-0800200c9a66")
 }
 
 object AppleDeviceModelResolver {
@@ -78,6 +84,16 @@ data class NowPlayingState(
     val title: String = "Sin reproducción",
     val artist: String = "Control multimedia",
     val isPlaying: Boolean = false
+)
+
+data class PhoneContextState(
+    val phoneBatteryPercent: Int? = null,
+    val phoneIsCharging: Boolean = false,
+    val weatherTempC: Int? = null,
+    val weatherCondition: String? = null,
+    val nextCalendarEvent: String? = null,
+    val companionPlatform: String = "iOS",
+    val companionConnected: Boolean = false
 )
 
 data class SyncedIphoneTime(
@@ -207,6 +223,7 @@ data class AncsNotificationHeader(
     val isPreExisting: Boolean get() = (eventFlags and 0x04) != 0
     val hasPositiveAction: Boolean get() = (eventFlags and 0x08) != 0
     val hasNegativeAction: Boolean get() = (eventFlags and 0x10) != 0
+    val isIncomingCall: Boolean get() = categoryId == 1
 }
 
 data class AncsNotification(
@@ -216,9 +233,15 @@ data class AncsNotification(
     val title: String,
     val subtitle: String,
     val message: String,
+    val categoryId: Int = 0,
+    val positiveActionLabel: String = "",
+    val negativeActionLabel: String = "",
     val receivedInDndMode: Boolean = false,
     val timestamp: Long = System.currentTimeMillis()
-)
+) {
+    val isIncomingCall: Boolean
+        get() = categoryId == 1 || appIdentifier == "com.apple.mobilephone"
+}
 
 object AppBundleResolver {
     private val knownBundles = mapOf(

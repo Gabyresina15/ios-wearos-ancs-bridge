@@ -5,16 +5,22 @@ watch-app/local.properties
 watch-app/*.iml
 watch-app/.idea/
 
-# Node
-backend/node_modules/
-backend/dist/
-web-companion/node_modules/
-web-companion/dist/
+android-app/.gradle/
+android-app/build/
+android-app/local.properties
+android-app/*.iml
+android-app/.idea/
 
-# Persistence
-backend/bridge-state.json
+# iOS / Xcode
+ios-app/*.xcodeproj/
+ios-app/*.xcworkspace/
+ios-app/build/
+ios-app/DerivedData/
+ios-app/Payload/
+ios-app/*.ipa
 
-# OS
+# OS & IDEs
+.idea/
 .DS_Store
 Thumbs.db
 *.log

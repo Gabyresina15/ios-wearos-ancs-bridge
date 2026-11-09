@@ -1,11 +1,8 @@
 package com.ancsbridge.watch.health
 
-import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.database.sqlite.SQLiteDatabase
-import android.database.sqlite.SQLiteOpenHelper
 import android.os.BatteryManager
 import android.util.Log
 import androidx.health.connect.client.HealthConnectClient
@@ -16,32 +13,23 @@ import androidx.health.connect.client.records.StepsRecord
 import androidx.health.connect.client.records.WeightRecord
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
-import com.ancsbridge.watch.BuildConfig
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.withContext
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Instant
 import java.time.ZonedDateTime
 import java.time.temporal.ChronoUnit
-import java.util.concurrent.TimeUnit
+import kotlin.math.max
 
 enum class HealthConnectStatus(val label: String) {
-    UNKNOWN("Verificando HC..."),
-    READY("Health Connect OK"),
-    PERMISSIONS_MISSING("Faltan Permisos HC"),
-    UNAVAILABLE("HC No Disponible")
+    UNKNOWN("Sensores Activos"),
+    READY("Salud + BIA Activo"),
+    PERMISSIONS_MISSING("Autorizar Peso/BIA"),
+    UNAVAILABLE("Sensores Directos OK")
 }
 
 data class WatchTelemetrySnapshot(
-    val id: Long = 0L,
     val watchBatteryPercent: Int,
     val isCharging: Boolean,
     val stepsToday: Long,
@@ -51,103 +39,11 @@ data class WatchTelemetrySnapshot(
     val timestamp: Long = System.currentTimeMillis()
 )
 
-class TelemetrySqliteQueue(context: Context) :
-    SQLiteOpenHelper(context, "ancs_telemetry_queue.db", null, 1) {
-
-    companion object {
-        private const val TABLE_QUEUE = "telemetry_queue"
-        private const val MAX_QUEUE_SIZE = 200
-    }
-
-    override fun onCreate(db: SQLiteDatabase) {
-        db.execSQL(
-            """
-            CREATE TABLE $TABLE_QUEUE (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                battery INTEGER NOT NULL,
-                charging INTEGER NOT NULL,
-                steps INTEGER NOT NULL,
-                hr INTEGER NOT NULL,
-                weight REAL,
-                body_fat REAL,
-                ts INTEGER NOT NULL
-            )
-            """.trimIndent()
-        )
-    }
-
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        db.execSQL("DROP TABLE IF EXISTS $TABLE_QUEUE")
-        onCreate(db)
-    }
-
-    @Synchronized
-    fun enqueue(snapshot: WatchTelemetrySnapshot) {
-        val db = writableDatabase
-        val values = ContentValues().apply {
-            put("battery", snapshot.watchBatteryPercent)
-            put("charging", if (snapshot.isCharging) 1 else 0)
-            put("steps", snapshot.stepsToday)
-            put("hr", snapshot.latestHeartRateBpm)
-            if (snapshot.weightKg != null) put("weight", snapshot.weightKg) else putNull("weight")
-            if (snapshot.bodyFatPercentage != null) put("body_fat", snapshot.bodyFatPercentage) else putNull("body_fat")
-            put("ts", snapshot.timestamp)
-        }
-        db.insert(TABLE_QUEUE, null, values)
-
-        db.execSQL(
-            """
-            DELETE FROM $TABLE_QUEUE WHERE id NOT IN (
-                SELECT id FROM $TABLE_QUEUE ORDER BY ts DESC LIMIT $MAX_QUEUE_SIZE
-            )
-            """.trimIndent()
-        )
-    }
-
-    @Synchronized
-    fun peekPending(limit: Int = 50): List<WatchTelemetrySnapshot> {
-        val list = mutableListOf<WatchTelemetrySnapshot>()
-        val db = readableDatabase
-        db.rawQuery("SELECT * FROM $TABLE_QUEUE ORDER BY ts ASC LIMIT $limit", null).use { cursor ->
-            while (cursor.moveToNext()) {
-                val weightIdx = cursor.getColumnIndexOrThrow("weight")
-                val fatIdx = cursor.getColumnIndexOrThrow("body_fat")
-                list.add(
-                    WatchTelemetrySnapshot(
-                        id = cursor.getLong(cursor.getColumnIndexOrThrow("id")),
-                        watchBatteryPercent = cursor.getInt(cursor.getColumnIndexOrThrow("battery")),
-                        isCharging = cursor.getInt(cursor.getColumnIndexOrThrow("charging")) == 1,
-                        stepsToday = cursor.getLong(cursor.getColumnIndexOrThrow("steps")),
-                        latestHeartRateBpm = cursor.getLong(cursor.getColumnIndexOrThrow("hr")),
-                        weightKg = if (cursor.isNull(weightIdx)) null else cursor.getDouble(weightIdx),
-                        bodyFatPercentage = if (cursor.isNull(fatIdx)) null else cursor.getDouble(fatIdx),
-                        timestamp = cursor.getLong(cursor.getColumnIndexOrThrow("ts"))
-                    )
-                )
-            }
-        }
-        return list
-    }
-
-    @Synchronized
-    fun deleteByIds(ids: List<Long>) {
-        if (ids.isEmpty()) return
-        val idCsv = ids.joinToString(",")
-        writableDatabase.execSQL("DELETE FROM $TABLE_QUEUE WHERE id IN ($idCsv)")
-    }
-
-    @Synchronized
-    fun count(): Int {
-        readableDatabase.rawQuery("SELECT COUNT(*) FROM $TABLE_QUEUE", null).use { cursor ->
-            return if (cursor.moveToFirst()) cursor.getInt(0) else 0
-        }
-    }
-}
-
 class TelemetrySyncManager(private val context: Context) {
 
     companion object {
         private const val TAG = "TelemetrySyncManager"
+        private const val PREFS_TELEMETRY = "ancs_telemetry_cache"
 
         val REQUIRED_HEALTH_PERMISSIONS = setOf(
             HealthPermission.getReadPermission(StepsRecord::class),
@@ -157,19 +53,15 @@ class TelemetrySyncManager(private val context: Context) {
         )
     }
 
-    private val queueDb = TelemetrySqliteQueue(context)
-
-    private val coldStartHttpClient = OkHttpClient.Builder()
-        .connectTimeout(60, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(60, TimeUnit.SECONDS)
-        .build()
+    private val hardwareSensors = HardwareSensorMonitor(context).also { it.startListening() }
+    private val prefs = context.getSharedPreferences(PREFS_TELEMETRY, Context.MODE_PRIVATE)
 
     private val _healthStatus = MutableStateFlow(HealthConnectStatus.UNKNOWN)
     val healthStatus: StateFlow<HealthConnectStatus> = _healthStatus.asStateFlow()
 
-    private val _pendingQueueCount = MutableStateFlow(queueDb.count())
-    val pendingQueueCount: StateFlow<Int> = _pendingQueueCount.asStateFlow()
+    fun release() {
+        hardwareSensors.stopListening()
+    }
 
     fun readBatteryState(): Pair<Int, Boolean> {
         val batteryStatus = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
@@ -192,8 +84,9 @@ class TelemetrySyncManager(private val context: Context) {
         return runCatching {
             val client = HealthConnectClient.getOrCreate(context)
             val granted = client.permissionController.getGrantedPermissions()
-            val hasStepsAndHr = granted.contains(HealthPermission.getReadPermission(StepsRecord::class))
-            val status = if (granted.containsAll(REQUIRED_HEALTH_PERMISSIONS) || hasStepsAndHr) {
+            val hasStepsOrWeight = granted.contains(HealthPermission.getReadPermission(StepsRecord::class)) ||
+                granted.contains(HealthPermission.getReadPermission(WeightRecord::class))
+            val status = if (granted.containsAll(REQUIRED_HEALTH_PERMISSIONS) || hasStepsOrWeight) {
                 HealthConnectStatus.READY
             } else {
                 HealthConnectStatus.PERMISSIONS_MISSING
@@ -210,11 +103,13 @@ class TelemetrySyncManager(private val context: Context) {
         val (batteryPct, isCharging) = readBatteryState()
         val correctedNowMillis = System.currentTimeMillis() + clockDriftMillis
 
-        var totalSteps = 0L
-        var latestHr = 0L
-        var latestWeightKg: Double? = null
-        var latestBodyFatPct: Double? = null
+        // 1. Lectura base directa desde los sensores físicos del Galaxy Watch 6
+        var totalSteps = hardwareSensors.stepsToday
+        var latestHr = hardwareSensors.latestHeartRateBpm
+        var latestWeightKg: Double? = prefs.getFloat("last_weight_kg", -1f).takeIf { it > 0f }?.toDouble()
+        var latestBodyFatPct: Double? = prefs.getFloat("last_body_fat_pct", -1f).takeIf { it > 0f }?.toDouble()
 
+        // 2. Enriquecimiento opcional con Health Connect (Samsung Health: Peso, BIA, Pasos y FC)
         val status = checkHealthConnectPermissions()
         if (status == HealthConnectStatus.READY) {
             runCatching {
@@ -229,7 +124,8 @@ class TelemetrySyncManager(private val context: Context) {
                         timeRangeFilter = TimeRangeFilter.between(startOfDay, now)
                     )
                 )
-                totalSteps = stepsResponse.records.sumOf { it.count }
+                val hcSteps = stepsResponse.records.sumOf { it.count }
+                totalSteps = max(totalSteps, hcSteps)
 
                 val hrResponse = client.readRecords(
                     ReadRecordsRequest(
@@ -237,10 +133,11 @@ class TelemetrySyncManager(private val context: Context) {
                         timeRangeFilter = TimeRangeFilter.between(startOfDay, now)
                     )
                 )
-                latestHr = hrResponse.records
+                val hcHr = hrResponse.records
                     .flatMap { it.samples }
                     .maxByOrNull { it.time }
                     ?.beatsPerMinute ?: 0L
+                if (hcHr > 0L) latestHr = hcHr
 
                 val weightResponse = client.readRecords(
                     ReadRecordsRequest(
@@ -248,9 +145,12 @@ class TelemetrySyncManager(private val context: Context) {
                         timeRangeFilter = TimeRangeFilter.between(last30Days, now)
                     )
                 )
-                latestWeightKg = weightResponse.records
+                weightResponse.records
                     .maxByOrNull { it.time }
-                    ?.weight?.inKilograms
+                    ?.weight?.inKilograms?.let { w ->
+                        latestWeightKg = w
+                        prefs.edit().putFloat("last_weight_kg", w.toFloat()).apply()
+                    }
 
                 val bodyFatResponse = client.readRecords(
                     ReadRecordsRequest(
@@ -258,13 +158,22 @@ class TelemetrySyncManager(private val context: Context) {
                         timeRangeFilter = TimeRangeFilter.between(last30Days, now)
                     )
                 )
-                latestBodyFatPct = bodyFatResponse.records
+                bodyFatResponse.records
                     .maxByOrNull { it.time }
-                    ?.percentage?.value
+                    ?.percentage?.value?.let { bf ->
+                        latestBodyFatPct = bf
+                        prefs.edit().putFloat("last_body_fat_pct", bf.toFloat()).apply()
+                    }
             }.onFailure { err ->
-                Log.e(TAG, "Error leyendo registros de Health Connect", err)
+                Log.w(TAG, "Usando sensores directos (Health Connect no respondió): ${err.message}")
             }
         }
+
+        prefs.edit()
+            .putInt("last_battery_pct", batteryPct)
+            .putLong("last_steps", totalSteps)
+            .putLong("last_hr_bpm", latestHr)
+            .apply()
 
         return WatchTelemetrySnapshot(
             watchBatteryPercent = batteryPct,
@@ -277,69 +186,28 @@ class TelemetrySyncManager(private val context: Context) {
         )
     }
 
-    fun toJson(snapshot: WatchTelemetrySnapshot): JSONObject {
+    /**
+     * Serializa el snapshot en formato JSON compacto (<160 bytes) para enviarlo en 1 paquete BLE GATT
+     * a través de la característica BRIDGE_TELEMETRY_CHAR hacia la app nativa de iOS o Android.
+     */
+    fun toBleJson(
+        snapshot: WatchTelemetrySnapshot,
+        isWatchMuted: Boolean,
+        isHfpConnected: Boolean,
+        isHidConnected: Boolean
+    ): String {
         return JSONObject().apply {
-            put("type", "TELEMETRY_SYNC")
-            put("watchBatteryPercent", snapshot.watchBatteryPercent)
-            put("isCharging", snapshot.isCharging)
-            put("stepsToday", snapshot.stepsToday)
-            put("latestHeartRateBpm", snapshot.latestHeartRateBpm)
-            put("weightKg", snapshot.weightKg ?: JSONObject.NULL)
-            put("bodyFatPercentage", snapshot.bodyFatPercentage ?: JSONObject.NULL)
-            put("timestamp", snapshot.timestamp)
-        }
-    }
-
-    fun enqueueOffline(snapshot: WatchTelemetrySnapshot) {
-        queueDb.enqueue(snapshot)
-        _pendingQueueCount.value = queueDb.count()
-    }
-
-    suspend fun enqueueAndFlushToBackend(snapshot: WatchTelemetrySnapshot): Boolean =
-        withContext(Dispatchers.IO) {
-            queueDb.enqueue(snapshot)
-            _pendingQueueCount.value = queueDb.count()
-            flushOfflineQueue()
-        }
-
-    suspend fun flushOfflineQueue(): Boolean = withContext(Dispatchers.IO) {
-        val pending = queueDb.peekPending(limit = 50)
-        if (pending.isEmpty()) return@withContext true
-
-        runCatching {
-            val wakeReq = Request.Builder()
-                .url("${BuildConfig.HTTP_BACKEND_URL}/health")
-                .get()
-                .build()
-            coldStartHttpClient.newCall(wakeReq).execute().close()
-
-            val batchArray = JSONArray()
-            pending.forEach { item -> batchArray.put(toJson(item)) }
-            val payload = JSONObject().apply {
-                put("items", batchArray)
-            }
-
-            val body = payload.toString()
-                .toRequestBody("application/json; charset=utf-8".toMediaType())
-
-            val postReq = Request.Builder()
-                .url("${BuildConfig.HTTP_BACKEND_URL}/api/telemetry/batch")
-                .post(body)
-                .build()
-
-            coldStartHttpClient.newCall(postReq).execute().use { response ->
-                if (response.isSuccessful) {
-                    queueDb.deleteByIds(pending.map { it.id })
-                    _pendingQueueCount.value = queueDb.count()
-                    Log.i(TAG, "Cola offline vaciada con éxito (${pending.size} registros).")
-                    true
-                } else {
-                    false
-                }
-            }
-        }.getOrElse { err ->
-            Log.w(TAG, "No se pudo vaciar la cola hacia Render: ${err.message}")
-            false
-        }
+            put("bat", snapshot.watchBatteryPercent)
+            put("chg", snapshot.isCharging)
+            put("steps", snapshot.stepsToday)
+            put("hr", snapshot.latestHeartRateBpm)
+            put("wt", snapshot.weightKg ?: JSONObject.NULL)
+            put("fat", snapshot.bodyFatPercentage ?: JSONObject.NULL)
+            put("dnd", isWatchMuted)
+            put("hfp", isHfpConnected)
+            put("hid", isHidConnected)
+            put("model", android.os.Build.MODEL)
+            put("ts", snapshot.timestamp)
+        }.toString()
     }
 }

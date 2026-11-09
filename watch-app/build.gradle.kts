@@ -11,11 +11,8 @@ android {
         applicationId = "com.ancsbridge.watch"
         minSdk = 33
         targetSdk = 34
-        versionCode = 2
-        versionName = "2.0.0"
-
-        buildConfigField("String", "WS_BACKEND_URL", "\"wss://ios-wearos-ancs-bridge.onrender.com/ws?role=watch\"")
-        buildConfigField("String", "HTTP_BACKEND_URL", "\"https://ios-wearos-ancs-bridge.onrender.com\"")
+        versionCode = 3
+        versionName = "3.0.0"
     }
 
     buildFeatures {
@@ -39,10 +36,14 @@ android {
 
 dependencies {
     implementation("androidx.wear.compose:compose-material:1.3.1")
-    implementation("androidx.wear.tiles:tiles:1.4.0")
-    implementation("androidx.wear.tiles:tiles-material:1.4.0")
-    implementation("com.google.guava:guava:32.1.3-android")
     implementation("androidx.wear.compose:compose-foundation:1.3.1")
+    implementation("androidx.wear.tiles:tiles:1.4.0")
+    implementation("androidx.wear.protolayout:protolayout:1.2.0")
+    implementation("androidx.wear.protolayout:protolayout-material:1.2.0")
+    implementation("androidx.wear.protolayout:protolayout-expression:1.2.0")
+    implementation("com.google.guava:guava:32.1.3-android")
+
+    implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-compose:1.9.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.2")
     implementation("androidx.lifecycle:lifecycle-service:2.8.2")
@@ -51,5 +52,4 @@ dependencies {
     implementation("androidx.health.connect:connect-client:1.1.0-alpha07")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }

@@ -283,10 +283,7 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
 
             peripheralManager.removeAllServices()
             peripheralManager.add(service)
-            isLocalServicePublished = true
-        }
-
-        if !peripheralManager.isAdvertising {
+        } else if !peripheralManager.isAdvertising {
             peripheralManager.startAdvertising([
                 CBAdvertisementDataServiceUUIDsKey: [BridgeBleUUIDs.bridgeService],
                 CBAdvertisementDataLocalNameKey: "WatchBridgeIOS"
@@ -296,18 +293,19 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
 
     private func buildCombinedPhoneContextPayload() -> [String: Any] {
         let level = UIDevice.current.batteryLevel
-        let pct = level >= 0 ? Int((level * 100).rounded()) : 100
         let state = UIDevice.current.batteryState
         let machineCode = DeviceHardwareResolver.currentMachineIdentifier()
 
         var payload: [String: Any] = [
             "cmd": "PHONE_CONTEXT",
-            "bat": pct,
             "chg": state == .charging || state == .full,
             "platform": "iOS",
             "phoneName": String(UIDevice.current.name.prefix(28)),
             "phoneModel": machineCode
         ]
+        if level >= 0 {
+            payload["bat"] = Int((level * 100).rounded())
+        }
         if let next = nextCalendarEventSummary() {
             payload["nextEvent"] = String(next.prefix(40))
         }
@@ -746,6 +744,22 @@ extension WatchBleCentralManager: CBPeripheralManagerDelegate {
             } else {
                 isLocalServicePublished = false
                 hasSubscribedWatchCentral = false
+            }
+        }
+    }
+
+    nonisolated func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: Error?) {
+        MainActor.assumeIsolated {
+            if error == nil {
+                isLocalServicePublished = true
+                if !peripheral.isAdvertising {
+                    peripheral.startAdvertising([
+                        CBAdvertisementDataServiceUUIDsKey: [BridgeBleUUIDs.bridgeService],
+                        CBAdvertisementDataLocalNameKey: "WatchBridgeIOS"
+                    ])
+                }
+            } else {
+                isLocalServicePublished = false
             }
         }
     }

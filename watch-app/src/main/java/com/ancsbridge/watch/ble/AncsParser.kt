@@ -10,16 +10,26 @@ object AncsProtocol {
     /**
      * Parsea los 8 bytes fijos del Notification Source (UUID: 9FBF120D-...).
      * Estructura: EventID(1B) | EventFlags(1B) | CategoryID(1B) | CategoryCount(1B) | NotificationUID(4B LE)
+     * Si el EventID es desconocido o corrupto, devuelve null.
      */
     fun parseNotificationSource(bytes: ByteArray): AncsNotificationHeader? {
         if (bytes.size < 8) return null
         val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-        val eventId = AncsEventId.fromByte(buffer.get())
+        val eventId = AncsEventId.fromByte(buffer.get()) ?: return null
         val eventFlags = buffer.get().toInt() and 0xFF
         val categoryId = buffer.get().toInt() and 0xFF
         val categoryCount = buffer.get().toInt() and 0xFF
         val uid = buffer.int
         return AncsNotificationHeader(eventId, eventFlags, categoryId, categoryCount, uid)
+    }
+
+    /**
+     * Calcula un requestCode positivo y libre de overflow de Int para cualquier UID de 32 bits de ANCS
+     * y cualquier offset de acción (0..7).
+     */
+    fun computeNotificationRequestCode(uid: Int, offset: Int): Int {
+        val maskedUid = uid and 0x07FF_FFFF
+        return (maskedUid shl 3) or (offset and 0x07)
     }
 
     /**
@@ -82,13 +92,19 @@ object AncsProtocol {
 
 /**
  * Ensamblador de paquetes fragmentados de la característica Data Source (22EAC6E9-...).
- * Soporta tanto respuestas GetNotificationAttributes (0x00) como GetAppAttributes (0x01).
+ * Soporta respuestas GetNotificationAttributes (0x00) y GetAppAttributes (0x01) con protección
+ * contra longitudes corruptas (`MAX_ATTRIBUTE_LENGTH`) y techo de memoria (`MAX_BUFFER_BYTES`).
  */
 class AncsDataSourceCollector(
     private val expectedAttributesCount: Int = 6,
     private val onAppAttributeParsed: ((bundleId: String, displayName: String) -> Unit)? = null,
     private val onNotificationParsed: (AncsNotification) -> Unit
 ) {
+    companion object {
+        const val MAX_ATTRIBUTE_LENGTH = 1024
+        const val MAX_BUFFER_BYTES = 4096
+    }
+
     private val accumulator = ByteArrayOutputStream()
     private var lastChunkTimestampMs: Long = 0L
 
@@ -99,6 +115,9 @@ class AncsDataSourceCollector(
             accumulator.reset()
         }
         lastChunkTimestampMs = now
+        if (accumulator.size() + chunk.size > MAX_BUFFER_BYTES) {
+            accumulator.reset()
+        }
         accumulator.write(chunk)
         tryParseBuffer()
     }
@@ -132,6 +151,10 @@ class AncsDataSourceCollector(
             if (buffer.remaining() < 3) return
             val attrId = buffer.get()
             val attrLen = buffer.short.toInt() and 0xFFFF
+            if (attrLen > MAX_ATTRIBUTE_LENGTH) {
+                accumulator.reset()
+                return
+            }
             if (buffer.remaining() < attrLen) return
 
             val payload = ByteArray(attrLen)
@@ -172,7 +195,6 @@ class AncsDataSourceCollector(
     }
 
     private fun tryParseAppAttributes(rawBytes: ByteArray) {
-        // Formato: 0x01 | AppIdentifier (null-terminated) | AttrId(1B) | AttrLen(2B LE) | Value(AttrLen B)
         var nullIndex = -1
         for (i in 1 until rawBytes.size) {
             if (rawBytes[i] == 0x00.toByte()) {
@@ -180,7 +202,7 @@ class AncsDataSourceCollector(
                 break
             }
         }
-        if (nullIndex == -1) return // Aún no llegó el null terminator del bundleId
+        if (nullIndex == -1) return
         val headerAfterNull = nullIndex + 1
         if (rawBytes.size < headerAfterNull + 3) return
 
@@ -188,6 +210,10 @@ class AncsDataSourceCollector(
             .order(ByteOrder.LITTLE_ENDIAN)
         buffer.get() // AttrId (0x00 = DisplayName)
         val attrLen = buffer.short.toInt() and 0xFFFF
+        if (attrLen > MAX_ATTRIBUTE_LENGTH) {
+            accumulator.reset()
+            return
+        }
         if (buffer.remaining() < attrLen) return
 
         val nameBytes = ByteArray(attrLen)

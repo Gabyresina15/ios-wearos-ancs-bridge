@@ -1,6 +1,6 @@
 package com.ancsbridge.watch.ble
 
-import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.os.Build
 import android.provider.Settings
@@ -49,8 +49,7 @@ object AppleBleUuids {
 }
 
 /**
- * Resuelve dinámicamente el nombre real y modelo del reloj Wear OS desde el sistema Android y Bluetooth,
- * sin ningún nombre hardcodeado.
+ * Resuelve dinámicamente el nombre real y modelo del reloj Wear OS desde el sistema Android y Bluetooth.
  */
 object WearDeviceIdentityResolver {
     private val samsungWatchModels = mapOf(
@@ -88,7 +87,7 @@ object WearDeviceIdentityResolver {
 
         val adapterName = runCatching {
             @Suppress("MissingPermission")
-            BluetoothAdapter.getDefaultAdapter()?.name
+            (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter?.name
         }.getOrNull()?.trim()
 
         val rawCandidate = listOfNotNull(globalName, secureBtName, adapterName)
@@ -108,7 +107,7 @@ object WearDeviceIdentityResolver {
 
 /**
  * Resuelve dinámicamente el nombre real del iPhone conectado combinando el servicio BLE GAP (0x2A00)
- * y el código de modelo de hardware BLE DIS (0x2A24), sin valores hardcodeados.
+ * y el código de modelo de hardware BLE DIS (0x2A24).
  */
 object AppleDeviceModelResolver {
     private val appleModels = mapOf(
@@ -158,7 +157,8 @@ data class NowPlayingState(
     val album: String = "",
     val playerName: String = "",
     val volumePercent: Int? = null,
-    val isPlaying: Boolean = false
+    val isPlaying: Boolean = false,
+    val isTruncated: Boolean = false
 )
 
 data class PhoneContextState(
@@ -223,9 +223,11 @@ object AmsEntityParser {
         if (bytes.size < 3) return current
         val entityId = bytes[0].toInt() and 0xFF
         val attrId = bytes[1].toInt() and 0xFF
+        val flags = bytes[2].toInt() and 0xFF
+        val truncated = (flags and 0x01) != 0
         val textValue = String(bytes, 3, bytes.size - 3, StandardCharsets.UTF_8).trim()
 
-        return when (entityId) {
+        val updated = when (entityId) {
             0 -> {
                 when (attrId) {
                     0 -> current.copy(playerName = textValue)
@@ -251,6 +253,7 @@ object AmsEntityParser {
             }
             else -> current
         }
+        return updated.copy(isTruncated = truncated)
     }
 }
 
@@ -260,7 +263,7 @@ enum class AncsEventId(val code: Byte) {
     REMOVED(2);
 
     companion object {
-        fun fromByte(b: Byte): AncsEventId = entries.firstOrNull { it.code == b } ?: ADDED
+        fun fromByte(b: Byte): AncsEventId? = entries.firstOrNull { it.code == b }
     }
 }
 

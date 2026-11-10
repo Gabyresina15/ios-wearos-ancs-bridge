@@ -1,6 +1,5 @@
 package com.ancsbridge.watch.ble
 
-import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
@@ -12,8 +11,8 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.graphics.drawable.Icon
 import android.media.AudioAttributes
 import android.media.Ringtone
 import android.media.RingtoneManager
@@ -24,7 +23,6 @@ import android.os.VibrationEffect
 import android.os.VibratorManager
 import android.util.Log
 import androidx.core.app.ServiceCompat
-import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import com.ancsbridge.watch.health.HealthConnectStatus
@@ -46,6 +44,7 @@ import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.min
 import kotlin.math.pow
 import kotlin.random.Random
@@ -60,8 +59,9 @@ class AncsBleService : LifecycleService() {
         private const val ALERTS_CHANNEL_ID = "ancs_ios_alerts_channel"
         private const val CALLS_CHANNEL_ID = "ancs_ios_calls_channel"
         private const val FG_NOTIFICATION_ID = 1001
-        private const val PASSIVE_SCAN_REQUEST_CODE = 2002
         private const val MAX_GATT_QUEUE_SIZE = 64
+        private const val MAX_PREPARED_WRITE_BYTES = 4096
+        private const val MAX_TRACKED_UID_METADATA = 128
         private const val GATT_OP_TIMEOUT_MS = 4500L
         private const val BLE_TELEMETRY_SYNC_INTERVAL_MS = 60_000L
 
@@ -112,16 +112,20 @@ class AncsBleService : LifecycleService() {
     private var connectedIphone: BluetoothDevice? = null
 
     @Volatile private var isAdvertising = false
+    @Volatile private var currentAdvertiseMode: Int = -1
     @Volatile private var isConnectingOrConnected = false
+    @Volatile private var servicesDiscoveryStarted = false
     @Volatile private var activeCallUid: Int? = null
     @Volatile private var isForegroundPromoted = false
 
     private var rawGapDeviceName: String? = null
     private var rawDisModelCode: String? = null
     private var reconnectAttempt = 0
+    private var connectJob: Job? = null
     private var reconnectJob: Job? = null
     private var scanTimeoutJob: Job? = null
     private var connectionWatchdogJob: Job? = null
+    private var mtuFallbackJob: Job? = null
     private var gattOpTimeoutJob: Job? = null
     private var periodicSyncJob: Job? = null
     private var watchAlarmTimeoutJob: Job? = null
@@ -191,18 +195,21 @@ class AncsBleService : LifecycleService() {
     private val _blockedBundles = MutableStateFlow<Set<String>>(emptySet())
     val blockedBundles: StateFlow<Set<String>> = _blockedBundles.asStateFlow()
 
-    private sealed class GattOperation {
-        data class ReadCharacteristic(val characteristic: BluetoothGattCharacteristic) : GattOperation()
-        data class WriteDescriptor(val descriptor: BluetoothGattDescriptor, val payload: ByteArray) : GattOperation()
-        data class WriteCharacteristic(
+    private val nextGattOpId = AtomicLong(1L)
+
+    private sealed class GattOperation(val opId: Long) {
+        class ReadCharacteristic(val characteristic: BluetoothGattCharacteristic, opId: Long) : GattOperation(opId)
+        class WriteDescriptor(val descriptor: BluetoothGattDescriptor, val payload: ByteArray, opId: Long) : GattOperation(opId)
+        class WriteCharacteristic(
             val characteristic: BluetoothGattCharacteristic,
             val payload: ByteArray,
-            val writeType: Int
-        ) : GattOperation()
+            val writeType: Int,
+            opId: Long
+        ) : GattOperation(opId)
     }
 
     private val gattQueue = ConcurrentLinkedQueue<GattOperation>()
-    @Volatile private var isGattBusy = false
+    @Volatile private var inFlightOpId: Long = 0L
 
     private val dataSourceCollector = AncsDataSourceCollector(
         expectedAttributesCount = 6,
@@ -251,7 +258,7 @@ class AncsBleService : LifecycleService() {
                                 panController.bindToIphone(d)
                                 hidController.bindToPhone(d)
                             }
-                            activeGatt?.discoverServices()
+                            activeGatt?.let { proceedToBondOrDiscover(it) }
                         }
                         BluetoothDevice.BOND_NONE -> {
                             resetGattAndReschedule(activeGatt, forceCacheRefresh = true)
@@ -293,34 +300,27 @@ class AncsBleService : LifecycleService() {
         registerReceiver(bondStateReceiver, IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED))
         BleReconnectWorker.enqueuePeriodicWatchdog(this)
 
-        lifecycleScope.launch(Dispatchers.IO) {
+        // Todas las operaciones de inicio BLE corren en el hilo principal para evitar carreras GATT 133
+        lifecycleScope.launch(Dispatchers.Main.immediate) {
             startBleBridgeIfNeeded()
             syncTelemetryNow()
         }
     }
 
     /**
-     * Promueve el servicio a Foreground UNA sola vez con canal IMPORTANCE_MIN, sin insignia y diferido,
-     * para que One UI Watch JAMÁS muestre el punto naranja en la esfera del reloj por la conexión BLE.
+     * Promueve el servicio a Foreground con tipo CONNECTED_DEVICE y canal IMPORTANCE_MIN, sin insignia
+     * y diferido, evitando el punto naranja en One UI Watch y protegiendo la vida del servicio en API 34.
      */
     private fun promoteToForegroundSafely() {
         if (isForegroundPromoted) return
         val notification = buildSilentForegroundNotification()
-        val hasBtConnect = ContextCompat.checkSelfPermission(
-            this, Manifest.permission.BLUETOOTH_CONNECT
-        ) == PackageManager.PERMISSION_GRANTED
-
         runCatching {
-            if (hasBtConnect) {
-                ServiceCompat.startForeground(
-                    this,
-                    FG_NOTIFICATION_ID,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-                )
-            } else {
-                startForeground(FG_NOTIFICATION_ID, notification)
-            }
+            ServiceCompat.startForeground(
+                this,
+                FG_NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            )
             isForegroundPromoted = true
         }.onFailure { err ->
             Log.w(TAG, "No se pudo promover FGS aún: ${err.message}")
@@ -397,10 +397,6 @@ class AncsBleService : LifecycleService() {
             .edit().putBoolean(KEY_ALLOW_DND_NOTIFS, enabled).apply()
     }
 
-    /**
-     * Pausa o reactiva por completo las notificaciones en el reloj.
-     * Cuando está en true (Silenciado/Pausado), no vibran NI aparecen notificaciones del sistema en el reloj.
-     */
     fun setWatchMuted(muted: Boolean) {
         _isWatchMuted.value = muted
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -445,48 +441,51 @@ class AncsBleService : LifecycleService() {
     }
 
     fun refreshConnectionOrReconnect() {
-        setupBridgeGattServer()
-        val adapter = bluetoothManager.adapter
-        if (adapter != null && adapter.isEnabled) {
-            startBalancedSolicitedAdvertising(adapter)
-        }
-        if (_connectionState.value == BleConnectionState.READY && activeGatt != null) {
-            requestIphoneBatteryLevel()
-            requestIphoneTimeSync()
-            runCatching { activeGatt?.discoverServices() }
-            syncTelemetryNow()
-        } else {
-            reconnectAttempt = 0
-            startBleBridgeIfNeeded()
+        lifecycleScope.launch(Dispatchers.Main.immediate) {
+            setupBridgeGattServer()
+            updateAdvertisingStateForCurrentLink()
+            if (_connectionState.value == BleConnectionState.READY && activeGatt != null) {
+                requestIphoneBatteryLevel()
+                requestIphoneTimeSync()
+                runCatching { activeGatt?.discoverServices() }
+                syncTelemetryNow()
+            } else {
+                reconnectAttempt = 0
+                startBleBridgeIfNeeded()
+            }
         }
     }
 
     fun startBleBridge() = startBleBridgeIfNeeded()
 
     fun startBleBridgeIfNeeded() {
-        val adapter = bluetoothManager.adapter ?: return
-        if (!adapter.isEnabled) return
+        lifecycleScope.launch(Dispatchers.Main.immediate) {
+            val adapter = bluetoothManager.adapter ?: return@launch
+            if (!adapter.isEnabled) return@launch
 
-        setupBridgeGattServer()
-        startBalancedSolicitedAdvertising(adapter)
+            setupBridgeGattServer()
+            updateAdvertisingStateForCurrentLink()
 
-        if (_connectionState.value == BleConnectionState.READY && activeGatt != null) return
+            if (_connectionState.value == BleConnectionState.READY && activeGatt != null) return@launch
 
-        val bondedIphone = findBondedPhone(adapter)
-        if (bondedIphone != null) {
-            saveTargetIphoneMac(bondedIphone.address)
-            updateDetectedPhoneName(bondedIphone.name, null)
-            connectToIphoneGatt(bondedIphone, autoConnect = true)
-            startHardwareFilteredLowPowerScan(adapter, bondedIphone.address)
-        } else {
-            startHardwareFilteredLowPowerScan(adapter, null)
+            val bondedIphone = findBondedPhone(adapter)
+            if (bondedIphone != null) {
+                saveTargetIphoneMac(bondedIphone.address)
+                updateDetectedPhoneName(bondedIphone.name, null)
+                connectToIphoneGatt(bondedIphone, autoConnect = true)
+                startHardwareFilteredLowPowerScan(adapter, bondedIphone.address)
+            } else {
+                startHardwareFilteredLowPowerScan(adapter, null)
+            }
         }
     }
 
     fun stopBleBridge() {
+        connectJob?.cancel()
         reconnectJob?.cancel()
         scanTimeoutJob?.cancel()
         connectionWatchdogJob?.cancel()
+        mtuFallbackJob?.cancel()
         gattOpTimeoutJob?.cancel()
         periodicSyncJob?.cancel()
         stopActiveLowPowerScan()
@@ -500,14 +499,19 @@ class AncsBleService : LifecycleService() {
         remoteIosCommandChar = null
         remoteIosWatchEventChar = null
         isConnectingOrConnected = false
+        servicesDiscoveryStarted = false
         subscribedCompanionDevices.clear()
         runCatching { gattServer?.close() }
         gattServer = null
         gattQueue.clear()
-        isGattBusy = false
+        inFlightOpId = 0L
         updateConnectionState(BleConnectionState.DISCONNECTED)
     }
 
+    /**
+     * Busca únicamente el iPhone vinculado por su MAC guardada o por nombre "iPhone"
+     * (evitando enlazar por error teléfonos Android cercanos).
+     */
     private fun findBondedPhone(adapter: BluetoothAdapter): BluetoothDevice? {
         val savedMac = getSavedIphoneMac()
         val bonded = adapter.bondedDevices ?: return null
@@ -518,8 +522,7 @@ class AncsBleService : LifecycleService() {
 
         return bonded.firstOrNull { device ->
             val name = device.name.orEmpty()
-            val isPhoneClass = device.bluetoothClass?.majorDeviceClass == BluetoothClass.Device.Major.PHONE
-            name.contains("iPhone", ignoreCase = true) || isPhoneClass
+            name.contains("iPhone", ignoreCase = true)
         }
     }
 
@@ -532,33 +535,44 @@ class AncsBleService : LifecycleService() {
     }
 
     private fun resetGattAndReschedule(gatt: BluetoothGatt?, forceCacheRefresh: Boolean) {
-        connectionWatchdogJob?.cancel()
-        gattOpTimeoutJob?.cancel()
-        periodicSyncJob?.cancel()
-        gattQueue.clear()
-        isGattBusy = false
-        isConnectingOrConnected = false
-        remoteIosTelemetryChar = null
-        remoteIosCommandChar = null
-        remoteIosWatchEventChar = null
+        lifecycleScope.launch(Dispatchers.Main.immediate) {
+            connectionWatchdogJob?.cancel()
+            mtuFallbackJob?.cancel()
+            gattOpTimeoutJob?.cancel()
+            periodicSyncJob?.cancel()
+            gattQueue.clear()
+            inFlightOpId = 0L
+            isConnectingOrConnected = false
+            servicesDiscoveryStarted = false
+            remoteIosTelemetryChar = null
+            remoteIosCommandChar = null
+            remoteIosWatchEventChar = null
 
-        if (forceCacheRefresh) refreshGattCache(gatt)
-        runCatching {
-            gatt?.disconnect()
-            gatt?.close()
-        }
-        if (activeGatt == gatt) activeGatt = null
+            if (forceCacheRefresh) refreshGattCache(gatt)
+            runCatching {
+                gatt?.disconnect()
+                gatt?.close()
+            }
+            if (activeGatt == gatt) activeGatt = null
 
-        if (subscribedCompanionDevices.isEmpty()) {
-            updateConnectionState(BleConnectionState.DISCONNECTED)
-            scheduleExponentialBackoffReconnect()
+            updateAdvertisingStateForCurrentLink()
+
+            if (subscribedCompanionDevices.isEmpty()) {
+                updateConnectionState(BleConnectionState.DISCONNECTED)
+                scheduleExponentialBackoffReconnect()
+            }
         }
     }
 
+    /**
+     * Escaneo BLE único con callback y corte estricto a los 15s o al conectar, evitando dejar
+     * escaneos duplicados por PendingIntent encendidos en segundo plano.
+     */
     private fun startHardwareFilteredLowPowerScan(adapter: BluetoothAdapter, targetMac: String?) {
         scanner = adapter.bluetoothLeScanner ?: return
-        val filters = mutableListOf<ScanFilter>()
+        stopActiveLowPowerScan()
 
+        val filters = mutableListOf<ScanFilter>()
         if (!targetMac.isNullOrBlank() && BluetoothAdapter.checkBluetoothAddress(targetMac)) {
             filters.add(ScanFilter.Builder().setDeviceAddress(targetMac).build())
         }
@@ -575,24 +589,17 @@ class AncsBleService : LifecycleService() {
             .setNumOfMatches(ScanSettings.MATCH_NUM_ONE_ADVERTISEMENT)
             .build()
 
-        val intent = Intent(this, BlePassiveScanReceiver::class.java).apply {
-            action = BlePassiveScanReceiver.ACTION_PASSIVE_BLE_FOUND
-        }
-        val pendingIntent = PendingIntent.getBroadcast(
-            this, PASSIVE_SCAN_REQUEST_CODE, intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
-        )
-        runCatching { scanner?.startScan(filters, settings, pendingIntent) }
         runCatching { scanner?.startScan(filters, settings, lowPowerScanCallback) }
 
         scanTimeoutJob?.cancel()
-        scanTimeoutJob = lifecycleScope.launch {
+        scanTimeoutJob = lifecycleScope.launch(Dispatchers.Main.immediate) {
             delay(15_000L)
             stopActiveLowPowerScan()
         }
     }
 
     private fun stopActiveLowPowerScan() {
+        scanTimeoutJob?.cancel()
         runCatching { scanner?.stopScan(lowPowerScanCallback) }
     }
 
@@ -619,7 +626,7 @@ class AncsBleService : LifecycleService() {
         if (totalDelaySeconds >= 60L) {
             BleReconnectWorker.scheduleExponentialReconnect(this, totalDelaySeconds)
         } else {
-            reconnectJob = lifecycleScope.launch(Dispatchers.IO) {
+            reconnectJob = lifecycleScope.launch(Dispatchers.Main.immediate) {
                 delay(totalDelaySeconds * 1000L)
                 triggerLowPowerFilteredReconnect()
             }
@@ -627,19 +634,21 @@ class AncsBleService : LifecycleService() {
     }
 
     private fun triggerLowPowerFilteredReconnect() {
-        val adapter = bluetoothManager.adapter ?: return
-        setupBridgeGattServer()
-        startBalancedSolicitedAdvertising(adapter)
-        if (_connectionState.value == BleConnectionState.READY && activeGatt != null) return
+        lifecycleScope.launch(Dispatchers.Main.immediate) {
+            val adapter = bluetoothManager.adapter ?: return@launch
+            setupBridgeGattServer()
+            updateAdvertisingStateForCurrentLink()
+            if (_connectionState.value == BleConnectionState.READY && activeGatt != null) return@launch
 
-        val bonded = findBondedPhone(adapter)
-        if (bonded != null) {
-            saveTargetIphoneMac(bonded.address)
-            updateDetectedPhoneName(bonded.name, null)
-            connectToIphoneGatt(bonded, autoConnect = true)
-            startHardwareFilteredLowPowerScan(adapter, bonded.address)
-        } else {
-            startHardwareFilteredLowPowerScan(adapter, null)
+            val bonded = findBondedPhone(adapter)
+            if (bonded != null) {
+                saveTargetIphoneMac(bonded.address)
+                updateDetectedPhoneName(bonded.name, null)
+                connectToIphoneGatt(bonded, autoConnect = true)
+                startHardwareFilteredLowPowerScan(adapter, bonded.address)
+            } else {
+                startHardwareFilteredLowPowerScan(adapter, null)
+            }
         }
     }
 
@@ -739,6 +748,7 @@ class AncsBleService : LifecycleService() {
                     _phoneContext.update {
                         it.copy(companionConnected = subscribedCompanionDevices.isNotEmpty() || remoteIosCommandChar != null)
                     }
+                    updateAdvertisingStateForCurrentLink()
                 }
             }
 
@@ -775,18 +785,27 @@ class AncsBleService : LifecycleService() {
                 offset: Int,
                 value: ByteArray?
             ) {
-                if (responseNeeded) {
-                    gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
-                }
                 if (characteristic.uuid == AppleBleUuids.BRIDGE_COMMAND_CONFIG_CHAR && value != null) {
                     subscribedCompanionDevices.add(device)
                     _phoneContext.update { it.copy(companionConnected = true) }
+                    updateAdvertisingStateForCurrentLink()
+
                     if (preparedWrite) {
                         val buf = preparedWriteBuffers.getOrPut(device.address) { ByteArrayOutputStream() }
+                        if (buf.size() + value.size > MAX_PREPARED_WRITE_BYTES) {
+                            preparedWriteBuffers.remove(device.address)
+                            if (responseNeeded) {
+                                gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_FAILURE, offset, null)
+                            }
+                            return
+                        }
                         buf.write(value)
                     } else {
                         handleCompanionBleCommand(String(value, StandardCharsets.UTF_8))
                     }
+                }
+                if (responseNeeded) {
+                    gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
                 }
             }
 
@@ -818,9 +837,11 @@ class AncsBleService : LifecycleService() {
                         if (_connectionState.value != BleConnectionState.READY) {
                             updateConnectionState(BleConnectionState.READY)
                         }
+                        updateAdvertisingStateForCurrentLink()
                         syncTelemetryNow()
                     } else {
                         subscribedCompanionDevices.remove(device)
+                        updateAdvertisingStateForCurrentLink()
                     }
                 }
             }
@@ -925,6 +946,7 @@ class AncsBleService : LifecycleService() {
                         companionConnected = true
                     )
                     updateConnectionState(BleConnectionState.READY)
+                    updateAdvertisingStateForCurrentLink()
                     syncTelemetryNow()
                 }
 
@@ -943,10 +965,6 @@ class AncsBleService : LifecycleService() {
         }
     }
 
-    /**
-     * Inicia una alarma audible y vibratoria real en el parlante del reloj cuando el usuario
-     * toca "Buscar reloj" en su iPhone.
-     */
     private fun startWatchFindAlarm() {
         _isWatchRinging.value = true
         val vibrator = (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
@@ -996,10 +1014,6 @@ class AncsBleService : LifecycleService() {
         }
     }
 
-    /**
-     * Envía un evento del reloj hacia la app de iOS tanto por servidor GATT local (Notify)
-     * como por escritura directa GATT Client si la app de iOS expone CBPeripheralManager en activeGatt.
-     */
     private fun notifyCompanionWatchEvent(eventJson: JSONObject) {
         val bytes = eventJson.toString().toByteArray(StandardCharsets.UTF_8)
 
@@ -1020,7 +1034,9 @@ class AncsBleService : LifecycleService() {
             } else {
                 BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
             }
-            enqueueGattOperation(GattOperation.WriteCharacteristic(remoteEventChar, bytes, writeType))
+            enqueueGattOperation(
+                GattOperation.WriteCharacteristic(remoteEventChar, bytes, writeType, nextGattOpId.incrementAndGet())
+            )
         }
     }
 
@@ -1058,7 +1074,9 @@ class AncsBleService : LifecycleService() {
             } else {
                 BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
             }
-            enqueueGattOperation(GattOperation.WriteCharacteristic(remoteTelChar, bytes, writeType))
+            enqueueGattOperation(
+                GattOperation.WriteCharacteristic(remoteTelChar, bytes, writeType, nextGattOpId.incrementAndGet())
+            )
         }
     }
 
@@ -1081,21 +1099,50 @@ class AncsBleService : LifecycleService() {
     }
 
     /**
-     * Publicidad BLE estrictamente menor a 31 bytes tanto en advertiseData como en scanResponse.
+     * Ajusta o apaga dinámicamente la publicidad BLE según el estado del enlace para ahorrar batería:
+     * • Si ANCS + App iOS están enlazados (READY + companionConnected), apaga el advertising (0% gasto).
+     * • Si ANCS está READY pero la app iOS aún no se suscribió, usa ADVERTISE_MODE_LOW_POWER.
+     * • Si está desconectado buscando enlace inicial, usa ADVERTISE_MODE_BALANCED.
      */
-    private fun startBalancedSolicitedAdvertising(adapter: BluetoothAdapter) {
-        if (isAdvertising) return
+    private fun updateAdvertisingStateForCurrentLink() {
+        val adapter = bluetoothManager.adapter ?: return
+        if (!adapter.isEnabled) {
+            stopSafeAdvertising()
+            return
+        }
+
+        val isAnscReady = _connectionState.value == BleConnectionState.READY
+        val isCompanionLinked = subscribedCompanionDevices.isNotEmpty() || remoteIosCommandChar != null || _phoneContext.value.companionConnected
+
+        if (isAnscReady && isCompanionLinked) {
+            stopSafeAdvertising()
+            return
+        }
+
+        val desiredMode = if (isAnscReady) {
+            AdvertiseSettings.ADVERTISE_MODE_LOW_POWER
+        } else {
+            AdvertiseSettings.ADVERTISE_MODE_BALANCED
+        }
+
+        if (isAdvertising && currentAdvertiseMode == desiredMode) {
+            return
+        }
+
+        stopSafeAdvertising()
         advertiser = adapter.bluetoothLeAdvertiser ?: return
 
-        val isFullyLinked = _connectionState.value == BleConnectionState.READY && _phoneContext.value.companionConnected
+        val txPower = if (desiredMode == AdvertiseSettings.ADVERTISE_MODE_LOW_POWER) {
+            AdvertiseSettings.ADVERTISE_TX_POWER_LOW
+        } else {
+            AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM
+        }
+
         val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(
-                if (isFullyLinked) AdvertiseSettings.ADVERTISE_MODE_BALANCED
-                else AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY
-            )
+            .setAdvertiseMode(desiredMode)
             .setConnectable(true)
             .setTimeout(0)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
+            .setTxPowerLevel(txPower)
             .build()
 
         val advertiseData = AdvertiseData.Builder()
@@ -1113,6 +1160,7 @@ class AncsBleService : LifecycleService() {
         runCatching {
             advertiser?.startAdvertising(settings, advertiseData, scanResponse, advertiseCallback)
             isAdvertising = true
+            currentAdvertiseMode = desiredMode
             if (_connectionState.value == BleConnectionState.DISCONNECTED) {
                 updateConnectionState(BleConnectionState.ADVERTISING)
             }
@@ -1123,6 +1171,7 @@ class AncsBleService : LifecycleService() {
         if (!isAdvertising) return
         runCatching { advertiser?.stopAdvertising(advertiseCallback) }
         isAdvertising = false
+        currentAdvertiseMode = -1
     }
 
     private val advertiseCallback = object : AdvertiseCallback() {
@@ -1135,25 +1184,45 @@ class AncsBleService : LifecycleService() {
         }
     }
 
-    @Synchronized
+    /**
+     * Conecta al iPhone serializando en el hilo principal y dejando 220ms de asentamiento tras
+     * cerrar un BluetoothGatt previo para evitar el error GATT 133 en controladores Bluetooth de Wear OS.
+     */
     private fun connectToIphoneGatt(device: BluetoothDevice, autoConnect: Boolean) {
         if (isConnectingOrConnected && activeGatt != null && connectedIphone?.address == device.address) {
             return
         }
         isConnectingOrConnected = true
+        servicesDiscoveryStarted = false
         connectedIphone = device
         updateDetectedPhoneName(device.name, null)
         updateConnectionState(BleConnectionState.CONNECTING)
 
-        runCatching { activeGatt?.close() }
-        activeGatt = device.connectGatt(this, autoConnect, gattClientCallback, BluetoothDevice.TRANSPORT_LE)
+        connectJob?.cancel()
+        connectJob = lifecycleScope.launch(Dispatchers.Main.immediate) {
+            val previousGatt = activeGatt
+            if (previousGatt != null) {
+                activeGatt = null
+                runCatching {
+                    previousGatt.disconnect()
+                    previousGatt.close()
+                }
+                delay(220L)
+            }
 
-        connectionWatchdogJob?.cancel()
-        if (!autoConnect) {
-            connectionWatchdogJob = lifecycleScope.launch {
-                delay(25_000L)
+            activeGatt = device.connectGatt(
+                this@AncsBleService,
+                autoConnect,
+                gattClientCallback,
+                BluetoothDevice.TRANSPORT_LE
+            )
+
+            connectionWatchdogJob?.cancel()
+            val watchdogTimeoutMs = if (autoConnect) 55_000L else 25_000L
+            connectionWatchdogJob = lifecycleScope.launch(Dispatchers.Main.immediate) {
+                delay(watchdogTimeoutMs)
                 if (_connectionState.value != BleConnectionState.READY) {
-                    resetGattAndReschedule(activeGatt, forceCacheRefresh = true)
+                    resetGattAndReschedule(activeGatt, forceCacheRefresh = !autoConnect)
                 }
             }
         }
@@ -1166,12 +1235,25 @@ class AncsBleService : LifecycleService() {
                 delay(20_000L)
                 if (_connectionState.value == BleConnectionState.READY) {
                     if (!_phoneContext.value.companionConnected && remoteIosCommandChar == null) {
-                        runCatching { activeGatt?.discoverServices() }
+                        withContext(Dispatchers.Main.immediate) {
+                            runCatching { activeGatt?.discoverServices() }
+                        }
                     }
                     syncTelemetryNow()
                 }
                 delay(BLE_TELEMETRY_SYNC_INTERVAL_MS - 20_000L)
             }
+        }
+    }
+
+    private fun proceedToBondOrDiscover(gatt: BluetoothGatt) {
+        mtuFallbackJob?.cancel()
+        if (gatt.device.bondState != BluetoothDevice.BOND_BONDED) {
+            updateConnectionState(BleConnectionState.BONDING)
+            gatt.device.createBond()
+        } else if (!servicesDiscoveryStarted) {
+            servicesDiscoveryStarted = true
+            gatt.discoverServices()
         }
     }
 
@@ -1191,6 +1273,7 @@ class AncsBleService : LifecycleService() {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     isConnectingOrConnected = true
+                    servicesDiscoveryStarted = false
                     reconnectAttempt = 0
                     reconnectJob?.cancel()
                     connectionWatchdogJob?.cancel()
@@ -1199,12 +1282,23 @@ class AncsBleService : LifecycleService() {
                     saveTargetIphoneMac(gatt.device.address)
                     updateDetectedPhoneName(gatt.device.name, null)
                     gattQueue.clear()
-                    isGattBusy = false
+                    inFlightOpId = 0L
                     dataSourceCollector.reset()
 
-                    // Prioridad alta durante el descubrimiento inicial para enlace instantáneo (< 400ms)
                     gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
-                    gatt.requestMtu(247)
+                    val mtuRequested = runCatching { gatt.requestMtu(247) }.getOrDefault(false)
+
+                    mtuFallbackJob?.cancel()
+                    if (!mtuRequested) {
+                        proceedToBondOrDiscover(gatt)
+                    } else {
+                        mtuFallbackJob = lifecycleScope.launch(Dispatchers.Main.immediate) {
+                            delay(2_200L)
+                            if (!servicesDiscoveryStarted && activeGatt == gatt) {
+                                proceedToBondOrDiscover(gatt)
+                            }
+                        }
+                    }
 
                     hfpController.bindToIphone(gatt.device)
                     panController.bindToIphone(gatt.device)
@@ -1218,15 +1312,14 @@ class AncsBleService : LifecycleService() {
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            if (gatt.device.bondState != BluetoothDevice.BOND_BONDED) {
-                updateConnectionState(BleConnectionState.BONDING)
-                gatt.device.createBond()
-            } else {
-                gatt.discoverServices()
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.w(TAG, "onMtuChanged devolvió status=$status (usando MTU por defecto=$mtu)")
             }
+            proceedToBondOrDiscover(gatt)
         }
 
         override fun onServiceChanged(gatt: BluetoothGatt) {
+            servicesDiscoveryStarted = true
             runCatching { gatt.discoverServices() }
         }
 
@@ -1245,12 +1338,12 @@ class AncsBleService : LifecycleService() {
 
                 remoteIosCommandChar?.let { cmdChar ->
                     enableCharacteristicNotifications(gatt, cmdChar)
-                    enqueueGattOperation(GattOperation.ReadCharacteristic(cmdChar))
+                    enqueueGattOperation(GattOperation.ReadCharacteristic(cmdChar, nextGattOpId.incrementAndGet()))
                 }
                 _phoneContext.update { it.copy(companionConnected = true) }
             }
 
-            // 2. Suscripción a ANCS (Notificaciones nativas del sistema iOS)
+            // 2. Suscripción a ANCS (Notificaciones nativas del sistema iOS: Data Source primero, luego Notification Source)
             val ancsService = gatt.getService(AppleBleUuids.ANCS_SERVICE)
             if (ancsService == null && iosBridgeService == null) {
                 if (gatt.device.bondState != BluetoothDevice.BOND_BONDED) {
@@ -1278,41 +1371,44 @@ class AncsBleService : LifecycleService() {
                 enqueueGattOperation(
                     GattOperation.WriteCharacteristic(
                         entityChar, AmsEntityParser.SUBSCRIBE_PLAYER_PLAYBACK_INFO,
-                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                        nextGattOpId.incrementAndGet()
                     )
                 )
                 enqueueGattOperation(
                     GattOperation.WriteCharacteristic(
                         entityChar, AmsEntityParser.SUBSCRIBE_TRACK_ARTIST_AND_TITLE,
-                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                        BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                        nextGattOpId.incrementAndGet()
                     )
                 )
             }
 
             gatt.getService(AppleBleUuids.GAP_SERVICE)
                 ?.getCharacteristic(AppleBleUuids.GAP_DEVICE_NAME_CHAR)
-                ?.let { enqueueGattOperation(GattOperation.ReadCharacteristic(it)) }
+                ?.let { enqueueGattOperation(GattOperation.ReadCharacteristic(it, nextGattOpId.incrementAndGet())) }
 
             gatt.getService(AppleBleUuids.DIS_SERVICE)
                 ?.getCharacteristic(AppleBleUuids.DIS_MODEL_NUMBER_CHAR)
-                ?.let { enqueueGattOperation(GattOperation.ReadCharacteristic(it)) }
+                ?.let { enqueueGattOperation(GattOperation.ReadCharacteristic(it, nextGattOpId.incrementAndGet())) }
 
             gatt.getService(AppleBleUuids.BAS_SERVICE)
                 ?.getCharacteristic(AppleBleUuids.BAS_BATTERY_LEVEL_CHAR)
                 ?.let {
                     enableCharacteristicNotifications(gatt, it)
-                    enqueueGattOperation(GattOperation.ReadCharacteristic(it))
+                    enqueueGattOperation(GattOperation.ReadCharacteristic(it, nextGattOpId.incrementAndGet()))
                 }
 
             gatt.getService(AppleBleUuids.CTS_SERVICE)
                 ?.getCharacteristic(AppleBleUuids.CTS_CURRENT_TIME_CHAR)
                 ?.let {
                     enableCharacteristicNotifications(gatt, it)
-                    enqueueGattOperation(GattOperation.ReadCharacteristic(it))
+                    enqueueGattOperation(GattOperation.ReadCharacteristic(it, nextGattOpId.incrementAndGet()))
                 }
 
             connectionWatchdogJob?.cancel()
             updateConnectionState(BleConnectionState.READY)
+            updateAdvertisingStateForCurrentLink()
             startPeriodicSyncLoop()
 
             lifecycleScope.launch(Dispatchers.IO) {
@@ -1320,7 +1416,6 @@ class AncsBleService : LifecycleService() {
                 panController.evaluateAndArbitrateNetwork()
                 syncTelemetryNow()
                 delay(2500)
-                // Pasamos a prioridad balanceada tras la ráfaga inicial para optimizar batería 24/7
                 runCatching { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED) }
             }
         }
@@ -1331,7 +1426,7 @@ class AncsBleService : LifecycleService() {
             value: ByteArray,
             status: Int
         ) {
-            completeCurrentGattOperation()
+            completeInFlightGattOperation()
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 when (characteristic.uuid) {
                     AppleBleUuids.GAP_DEVICE_NAME_CHAR ->
@@ -1350,11 +1445,11 @@ class AncsBleService : LifecycleService() {
         }
 
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-            completeCurrentGattOperation()
+            completeInFlightGattOperation()
         }
 
         override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-            completeCurrentGattOperation()
+            completeInFlightGattOperation()
         }
 
         override fun onCharacteristicChanged(
@@ -1388,10 +1483,6 @@ class AncsBleService : LifecycleService() {
         }
     }
 
-    /**
-     * Actualiza el nombre del iPhone sin sobrescribir jamás un nombre real de GAP (ej. "iPhone de ...")
-     * con el string genérico "iPhone" que devuelve UIDevice.current.name en iOS 16+.
-     */
     private fun updateDetectedPhoneName(newGapName: String?, newModelCode: String?) {
         val cleanCandidate = newGapName?.trim()
         if (!cleanCandidate.isNullOrBlank()) {
@@ -1417,13 +1508,13 @@ class AncsBleService : LifecycleService() {
     fun requestIphoneTimeSync() {
         val char = activeGatt?.getService(AppleBleUuids.CTS_SERVICE)
             ?.getCharacteristic(AppleBleUuids.CTS_CURRENT_TIME_CHAR) ?: return
-        enqueueGattOperation(GattOperation.ReadCharacteristic(char))
+        enqueueGattOperation(GattOperation.ReadCharacteristic(char, nextGattOpId.incrementAndGet()))
     }
 
     fun requestIphoneBatteryLevel() {
         val char = activeGatt?.getService(AppleBleUuids.BAS_SERVICE)
             ?.getCharacteristic(AppleBleUuids.BAS_BATTERY_LEVEL_CHAR) ?: return
-        enqueueGattOperation(GattOperation.ReadCharacteristic(char))
+        enqueueGattOperation(GattOperation.ReadCharacteristic(char, nextGattOpId.incrementAndGet()))
     }
 
     private fun handleIphoneBatteryPayload(bytes: ByteArray) {
@@ -1502,7 +1593,9 @@ class AncsBleService : LifecycleService() {
     private fun enableCharacteristicNotifications(gatt: BluetoothGatt, char: BluetoothGattCharacteristic) {
         gatt.setCharacteristicNotification(char, true)
         val cccd = char.getDescriptor(AppleBleUuids.CCCD) ?: return
-        enqueueGattOperation(GattOperation.WriteDescriptor(cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE))
+        enqueueGattOperation(
+            GattOperation.WriteDescriptor(cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE, nextGattOpId.incrementAndGet())
+        )
     }
 
     private fun handleNotificationSourceEvent(payload: ByteArray) {
@@ -1513,6 +1606,12 @@ class AncsBleService : LifecycleService() {
                 if (_isWatchMuted.value && !header.isIncomingCall) return
                 if (header.isSilent && !_allowDndNotifications.value && !header.isIncomingCall) return
 
+                if (silentFlagsByUid.size >= MAX_TRACKED_UID_METADATA) {
+                    silentFlagsByUid.keys().nextElement()?.let { silentFlagsByUid.remove(it) }
+                }
+                if (categoryByUid.size >= MAX_TRACKED_UID_METADATA) {
+                    categoryByUid.keys().nextElement()?.let { categoryByUid.remove(it) }
+                }
                 silentFlagsByUid[header.notificationUid] = header.isSilent
                 categoryByUid[header.notificationUid] = header.categoryId
 
@@ -1521,7 +1620,8 @@ class AncsBleService : LifecycleService() {
                 val cmdBytes = AncsProtocol.buildGetNotificationAttributesCommand(header.notificationUid)
                 enqueueGattOperation(
                     GattOperation.WriteCharacteristic(
-                        controlPoint, cmdBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                        controlPoint, cmdBytes, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                        nextGattOpId.incrementAndGet()
                     )
                 )
             }
@@ -1546,7 +1646,6 @@ class AncsBleService : LifecycleService() {
         if (_blockedBundles.value.contains(notification.appIdentifier) && !notification.isIncomingCall) return
         if (_isWatchMuted.value && !notification.isIncomingCall) return
 
-        // Si no conocemos aún el nombre real oficial de esta app en iOS, lo consultamos con GetAppAttributes (0x01)
         val bundleId = notification.appIdentifier
         if (bundleId.isNotBlank() && !AppBundleResolver.hasResolvedName(bundleId) && pendingAppNameQueries.add(bundleId)) {
             activeGatt?.getService(AppleBleUuids.ANCS_SERVICE)
@@ -1555,7 +1654,8 @@ class AncsBleService : LifecycleService() {
                     val appAttrCmd = AncsProtocol.buildGetAppAttributesCommand(bundleId)
                     enqueueGattOperation(
                         GattOperation.WriteCharacteristic(
-                            controlPoint, appAttrCmd, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                            controlPoint, appAttrCmd, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                            nextGattOpId.incrementAndGet()
                         )
                     )
                 }
@@ -1624,7 +1724,10 @@ class AncsBleService : LifecycleService() {
         if (controlPoint != null) {
             val cmd = AncsProtocol.buildPerformNotificationActionCommand(uid, action)
             enqueueGattOperation(
-                GattOperation.WriteCharacteristic(controlPoint, cmd, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+                GattOperation.WriteCharacteristic(
+                    controlPoint, cmd, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                    nextGattOpId.incrementAndGet()
+                )
             )
         }
         if (action == AncsActionId.NEGATIVE) {
@@ -1638,7 +1741,8 @@ class AncsBleService : LifecycleService() {
         if (char != null) {
             enqueueGattOperation(
                 GattOperation.WriteCharacteristic(
-                    char, byteArrayOf(command.code), BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    char, byteArrayOf(command.code), BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                    nextGattOpId.incrementAndGet()
                 )
             )
         }
@@ -1659,31 +1763,46 @@ class AncsBleService : LifecycleService() {
         }
     }
 
+    /**
+     * Encola operaciones GATT protegiendo siempre las suscripciones de descriptores CCCD (jamás se descartan)
+     * y utilizando un token de operación en vuelo (`inFlightOpId`) para evitar condiciones de carrera por timeout.
+     */
     @Synchronized
     private fun enqueueGattOperation(operation: GattOperation) {
-        if (gattQueue.size >= MAX_GATT_QUEUE_SIZE) gattQueue.poll()
+        if (gattQueue.size >= MAX_GATT_QUEUE_SIZE) {
+            val nonDescriptor = gattQueue.firstOrNull { it !is GattOperation.WriteDescriptor }
+            if (nonDescriptor != null) {
+                gattQueue.remove(nonDescriptor)
+            } else {
+                gattQueue.poll()
+            }
+        }
         gattQueue.add(operation)
-        if (!isGattBusy) processNextGattOperation()
+        if (inFlightOpId == 0L) processNextGattOperation()
     }
 
     @Synchronized
-    private fun completeCurrentGattOperation() {
+    private fun completeInFlightGattOperation(expectedOpId: Long? = null) {
+        if (expectedOpId != null && inFlightOpId != expectedOpId) {
+            return
+        }
         gattOpTimeoutJob?.cancel()
-        isGattBusy = false
+        inFlightOpId = 0L
         processNextGattOperation()
     }
 
     @Synchronized
     private fun processNextGattOperation() {
         val gatt = activeGatt ?: return
-        if (isGattBusy) return
+        if (inFlightOpId != 0L) return
         val nextOp = gattQueue.poll() ?: return
-        isGattBusy = true
+        val currentOpId = nextOp.opId
+        inFlightOpId = currentOpId
 
         gattOpTimeoutJob?.cancel()
         gattOpTimeoutJob = lifecycleScope.launch {
             delay(GATT_OP_TIMEOUT_MS)
-            if (isGattBusy) completeCurrentGattOperation()
+            completeInFlightGattOperation(expectedOpId = currentOpId)
         }
 
         val dispatched = runCatching {
@@ -1696,7 +1815,9 @@ class AncsBleService : LifecycleService() {
             }
         }.getOrDefault(false)
 
-        if (!dispatched) completeCurrentGattOperation()
+        if (!dispatched) {
+            completeInFlightGattOperation(expectedOpId = currentOpId)
+        }
     }
 
     private fun stopCallVibrationIfNeeded() {
@@ -1707,17 +1828,21 @@ class AncsBleService : LifecycleService() {
         }
     }
 
+    /**
+     * Construye un PendingIntent inmutable con requestCode libre de overflow de Int.
+     */
     private fun buildNotificationOpPendingIntent(uid: Int, op: String, requestCodeOffset: Int): PendingIntent {
         val intent = Intent(this, BlePassiveScanReceiver::class.java).apply {
             action = BlePassiveScanReceiver.ACTION_NOTIFICATION_ACTION
             putExtra(BlePassiveScanReceiver.EXTRA_NOTIF_UID, uid)
             putExtra(BlePassiveScanReceiver.EXTRA_NOTIF_OP, op)
         }
+        val safeRequestCode = AncsProtocol.computeNotificationRequestCode(uid, requestCodeOffset)
         return PendingIntent.getBroadcast(
             this,
-            (uid * 10) + requestCodeOffset,
+            safeRequestCode,
             intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
     }
 
@@ -1745,10 +1870,12 @@ class AncsBleService : LifecycleService() {
         }.ifEmpty { item.appDisplayName }
 
         val openAppIntent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
         }
         val contentPendingIntent = PendingIntent.getActivity(
-            this, item.uid, openAppIntent,
+            this,
+            AncsProtocol.computeNotificationRequestCode(item.uid, 0),
+            openAppIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
@@ -1779,14 +1906,14 @@ class AncsBleService : LifecycleService() {
             builder.setFullScreenIntent(contentPendingIntent, true)
             builder.addAction(
                 Notification.Action.Builder(
-                    android.R.drawable.ic_menu_call,
+                    Icon.createWithResource(this, android.R.drawable.ic_menu_call),
                     item.positiveActionLabel.ifEmpty { "Contestar" },
                     positivePendingIntent
                 ).build()
             )
             builder.addAction(
                 Notification.Action.Builder(
-                    android.R.drawable.ic_menu_close_clear_cancel,
+                    Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
                     item.negativeActionLabel.ifEmpty { "Rechazar" },
                     negativePendingIntent
                 ).build()
@@ -1795,7 +1922,7 @@ class AncsBleService : LifecycleService() {
             if (item.positiveActionLabel.isNotBlank()) {
                 builder.addAction(
                     Notification.Action.Builder(
-                        android.R.drawable.ic_input_add,
+                        Icon.createWithResource(this, android.R.drawable.ic_input_add),
                         item.positiveActionLabel,
                         positivePendingIntent
                     ).build()
@@ -1804,7 +1931,7 @@ class AncsBleService : LifecycleService() {
 
             builder.addAction(
                 Notification.Action.Builder(
-                    android.R.drawable.ic_menu_close_clear_cancel,
+                    Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
                     item.negativeActionLabel.ifEmpty { "Descartar" },
                     negativePendingIntent
                 ).build()
@@ -1873,7 +2000,7 @@ class AncsBleService : LifecycleService() {
             .setContentText("Activo en segundo plano")
             .setContentIntent(pendingIntent)
             .setLocalOnly(true)
-            .setOngoing(false)
+            .setOngoing(true)
             .setShowWhen(false)
             .setGroup("ancs_silent_bg_service")
             .setGroupAlertBehavior(Notification.GROUP_ALERT_SUMMARY)

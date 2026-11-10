@@ -16,9 +16,10 @@ import kotlinx.coroutines.launch
 import java.time.LocalDate
 
 /**
- * Monitor directo de sensores de hardware del reloj Wear OS (TYPE_STEP_COUNTER y TYPE_HEART_RATE).
- * Soporta medición continua de pasos con notificación en tiempo real y ráfagas de alta precisión
- * bajo demanda para el sensor óptico PPG.
+ * Monitor directo de sensores de hardware del reloj Wear OS.
+ * • Mantiene registrado únicamente el coprocesador de bajo consumo `TYPE_STEP_COUNTER` (con throttle de 3.5s).
+ * • El sensor óptico PPG (`TYPE_HEART_RATE`) SOLO se enciende durante las ráfagas bajo demanda de 14s
+ *   (`triggerHeartRateBurst`), eliminando por completo el drenaje continuo de batería.
  */
 class HardwareSensorMonitor(
     context: Context,
@@ -32,6 +33,7 @@ class HardwareSensorMonitor(
         private const val KEY_CACHED_TODAY_STEPS = "step_cached_today"
         private const val KEY_CACHED_HR_BPM = "hr_cached_bpm"
         private const val STEP_PUSH_THROTTLE_MS = 3_500L
+        private const val HR_PUSH_THROTTLE_MS = 12_000L
     }
 
     private val appContext = context.applicationContext
@@ -52,6 +54,8 @@ class HardwareSensorMonitor(
     private var isListening = false
     private var burstJob: Job? = null
     private var lastStepNotifyMillis = 0L
+    private var lastHrNotifyMillis = 0L
+    private var burstFirstSampleDelivered = false
 
     var onHeartRateUpdated: ((Long) -> Unit)? = null
     var onStepsUpdated: ((Long) -> Unit)? = null
@@ -61,22 +65,21 @@ class HardwareSensorMonitor(
         val sm = sensorManager ?: return
         isListening = true
 
+        // Solo el podómetro de hardware (ultra bajo consumo) queda activo en segundo plano
         sm.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)?.let { stepSensor ->
             sm.registerListener(this, stepSensor, SensorManager.SENSOR_DELAY_NORMAL)
-        }
-        sm.getDefaultSensor(Sensor.TYPE_HEART_RATE)?.let { hrSensor ->
-            sm.registerListener(this, hrSensor, SensorManager.SENSOR_DELAY_NORMAL)
         }
     }
 
     /**
-     * Activa una medición activa de pulso de 14 segundos a máxima frecuencia (SENSOR_DELAY_FASTEST)
-     * cuando el usuario toca "Medir pulso" en el reloj o en la app del iPhone.
+     * Activa una medición puntual de pulso de 14 segundos (SENSOR_DELAY_FASTEST) y apaga el LED óptico
+     * PPG inmediatamente al terminar para proteger la batería del reloj.
      */
     fun triggerHeartRateBurst() {
         val sm = sensorManager ?: return
         val hrSensor = sm.getDefaultSensor(Sensor.TYPE_HEART_RATE) ?: return
 
+        burstFirstSampleDelivered = false
         _isMeasuringHr.value = true
         runCatching {
             sm.unregisterListener(this, hrSensor)
@@ -89,7 +92,6 @@ class HardwareSensorMonitor(
             _isMeasuringHr.value = false
             runCatching {
                 sm.unregisterListener(this@HardwareSensorMonitor, hrSensor)
-                sm.registerListener(this@HardwareSensorMonitor, hrSensor, SensorManager.SENSOR_DELAY_NORMAL)
             }
         }
     }
@@ -138,10 +140,13 @@ class HardwareSensorMonitor(
                 if (bpm in 30L..240L) {
                     latestHeartRateBpm = bpm
                     prefs.edit().putLong(KEY_CACHED_HR_BPM, bpm).apply()
-                    if (_isMeasuringHr.value) {
-                        _isMeasuringHr.value = false
+
+                    val now = System.currentTimeMillis()
+                    if (!burstFirstSampleDelivered || now - lastHrNotifyMillis >= HR_PUSH_THROTTLE_MS) {
+                        burstFirstSampleDelivered = true
+                        lastHrNotifyMillis = now
+                        onHeartRateUpdated?.invoke(bpm)
                     }
-                    onHeartRateUpdated?.invoke(bpm)
                 }
             }
         }

@@ -49,6 +49,10 @@ class BleReconnectWorker(appContext: Context, params: WorkerParameters) : Corout
     }
 }
 
+/**
+ * Receiver interno (android:exported="false") para acciones de notificaciones ANCS y eventos locales.
+ * Ninguna aplicación de terceros puede invocarlo.
+ */
 class BlePassiveScanReceiver : BroadcastReceiver() {
 
     companion object {
@@ -81,6 +85,29 @@ class BlePassiveScanReceiver : BroadcastReceiver() {
                 }
             }
 
+            ACTION_NOTIFICATION_ACTION -> {
+                val uid = intent.getIntExtra(EXTRA_NOTIF_UID, -1)
+                if (uid == -1) return
+                val op = intent.getStringExtra(EXTRA_NOTIF_OP) ?: return
+
+                val serviceIntent = Intent(context, AncsBleService::class.java).apply {
+                    action = AncsBleService.ACTION_HANDLE_NOTIF_INTENT
+                    putExtra(EXTRA_NOTIF_UID, uid)
+                    putExtra(EXTRA_NOTIF_OP, op)
+                }
+                runCatching { context.startForegroundService(serviceIntent) }
+            }
+        }
+    }
+}
+
+/**
+ * Receiver dedicado a broadcasts del sistema Android (Boot, reemplazo de APK y reconexión ACL Bluetooth).
+ */
+class SystemBootAndBtReceiver : BroadcastReceiver() {
+
+    override fun onReceive(context: Context, intent: Intent) {
+        when (intent.action) {
             BluetoothDevice.ACTION_ACL_CONNECTED -> {
                 val device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
                 val serviceIntent = Intent(context, AncsBleService::class.java).apply {
@@ -98,19 +125,6 @@ class BlePassiveScanReceiver : BroadcastReceiver() {
                     }
                     runCatching { context.startForegroundService(serviceIntent) }
                 }
-            }
-
-            ACTION_NOTIFICATION_ACTION -> {
-                val uid = intent.getIntExtra(EXTRA_NOTIF_UID, -1)
-                if (uid == -1) return
-                val op = intent.getStringExtra(EXTRA_NOTIF_OP) ?: return
-
-                val serviceIntent = Intent(context, AncsBleService::class.java).apply {
-                    action = AncsBleService.ACTION_HANDLE_NOTIF_INTENT
-                    putExtra(EXTRA_NOTIF_UID, uid)
-                    putExtra(EXTRA_NOTIF_OP, op)
-                }
-                runCatching { context.startForegroundService(serviceIntent) }
             }
 
             Intent.ACTION_BOOT_COMPLETED,

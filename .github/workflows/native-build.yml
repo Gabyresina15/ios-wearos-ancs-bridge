@@ -25,11 +25,11 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
-      - name: Build Wear OS Debug APK
+      - name: Run Unit Tests, Lint & Build Wear OS Debug APK
         working-directory: ./watch-app
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
+          ./gradlew testDebugUnitTest lintDebug assembleDebug --no-daemon
 
       - name: Upload Wear OS APK Artifact
         uses: actions/upload-artifact@v4

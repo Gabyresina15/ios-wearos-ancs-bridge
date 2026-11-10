@@ -11,8 +11,8 @@ android {
         applicationId = "com.ancsbridge.watch"
         minSdk = 33
         targetSdk = 34
-        versionCode = 3
-        versionName = "3.0.0"
+        versionCode = 4
+        versionName = "3.2.0"
     }
 
     buildFeatures {
@@ -52,4 +52,6 @@ dependencies {
     implementation("androidx.health.connect:connect-client:1.1.0-alpha07")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+
+    testImplementation("junit:junit:4.13.2")
 }

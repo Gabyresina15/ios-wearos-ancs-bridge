@@ -4,6 +4,7 @@
     <uses-feature android:name="android.hardware.type.watch" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
 
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
@@ -89,12 +90,21 @@
                 android:resource="@mipmap/ic_launcher" />
         </service>
 
+        <!-- Receiver interno NO exportado para acciones de notificaciones ANCS (protegido contra apps de terceros) -->
         <receiver
             android:name=".ble.BlePassiveScanReceiver"
-            android:exported="true">
+            android:exported="false">
             <intent-filter>
                 <action android:name="com.ancsbridge.watch.ACTION_PASSIVE_BLE_FOUND" />
                 <action android:name="com.ancsbridge.watch.ACTION_NOTIFICATION_ACTION" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Receiver de eventos del sistema Android (Boot, actualización de paquete y reconexión ACL Bluetooth) -->
+        <receiver
+            android:name=".ble.SystemBootAndBtReceiver"
+            android:exported="true">
+            <intent-filter>
                 <action android:name="android.bluetooth.device.action.ACL_CONNECTED" />
                 <action android:name="android.bluetooth.adapter.action.STATE_CHANGED" />
                 <action android:name="android.intent.action.BOOT_COMPLETED" />

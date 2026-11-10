@@ -52,6 +52,7 @@ class HidShutterController(
 
     private var hidDevice: BluetoothHidDevice? = null
     private var targetPhone: BluetoothDevice? = null
+    private var pendingShutterPulse = false
     private val executor = Executors.newSingleThreadExecutor()
 
     private val _isHidConnected = MutableStateFlow(false)
@@ -59,18 +60,18 @@ class HidShutterController(
 
     private val hidCallback = object : BluetoothHidDevice.Callback() {
         override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
-            if (registered) {
-                val device = targetPhone ?: pluggedDevice
-                if (device != null) {
-                    runCatching { hidDevice?.connect(device) }
-                }
-            } else {
+            if (!registered) {
                 _isHidConnected.value = false
             }
         }
 
         override fun onConnectionStateChanged(device: BluetoothDevice?, state: Int) {
-            _isHidConnected.value = (state == BluetoothProfile.STATE_CONNECTED)
+            val connected = (state == BluetoothProfile.STATE_CONNECTED)
+            _isHidConnected.value = connected
+            if (connected && device != null && pendingShutterPulse) {
+                pendingShutterPulse = false
+                dispatchPulseAndDisconnect(device)
+            }
         }
     }
 
@@ -100,11 +101,13 @@ class HidShutterController(
 
     private fun registerHidApp() {
         val hid = hidDevice ?: return
+        // IMPORTANTE: Usamos SUBCLASS1_NONE (no SUBCLASS1_COMBO ni KEYBOARD) para que iOS
+        // NO interprete el reloj como un teclado físico externo y NO oculte el teclado en pantalla del iPhone.
         val sdp = BluetoothHidDeviceAppSdpSettings(
             "GW6 Remote Shutter",
-            "Wear OS Camera & Media Remote",
+            "Wear OS Camera Remote",
             "Samsung",
-            BluetoothHidDevice.SUBCLASS1_COMBO,
+            BluetoothHidDevice.SUBCLASS1_NONE,
             HID_REPORT_DESCRIPTOR
         )
         runCatching {
@@ -112,38 +115,51 @@ class HidShutterController(
         }
     }
 
+    /**
+     * Guarda la referencia del iPhone sin mantener una sesión HID permanente,
+     * evitando que iOS bloquee u oculte el teclado virtual en pantalla.
+     */
     fun bindToPhone(device: BluetoothDevice) {
         targetPhone = device
         val hid = hidDevice ?: return
         runCatching {
-            if (hid.getConnectionState(device) != BluetoothProfile.STATE_CONNECTED) {
-                hid.connect(device)
-            } else {
-                _isHidConnected.value = true
+            if (hid.getConnectionState(device) == BluetoothProfile.STATE_CONNECTED) {
+                hid.disconnect(device)
             }
         }
     }
 
     /**
-     * Dispara el obturador enviando la pulsación HID de Volume Up (0x01) seguida de su liberación (0x00).
-     * Retorna true si se envió por HID nativo.
+     * Conecta bajo demanda el perfil HID, envía el pulso Consumer Control Volume Up (0x01 -> 0x00)
+     * y desconecta inmediatamente el perfil HID para no interferir con el teclado virtual de iOS.
      */
     fun sendShutterVolumeUpPulse(): Boolean {
         val hid = hidDevice ?: return false
-        val device = targetPhone ?: hid.connectedDevices.firstOrNull() ?: return false
+        val device = targetPhone ?: return false
 
         return runCatching {
-            if (hid.getConnectionState(device) != BluetoothProfile.STATE_CONNECTED) {
+            if (hid.getConnectionState(device) == BluetoothProfile.STATE_CONNECTED) {
+                dispatchPulseAndDisconnect(device)
+            } else {
+                pendingShutterPulse = true
                 hid.connect(device)
-                return false
             }
-            val pressed = hid.sendReport(device, REPORT_ID_CONSUMER, byteArrayOf(0x01))
-            scope.launch(Dispatchers.IO) {
-                delay(65)
-                runCatching { hid.sendReport(device, REPORT_ID_CONSUMER, byteArrayOf(0x00)) }
-            }
-            pressed
+            true
         }.getOrDefault(false)
+    }
+
+    private fun dispatchPulseAndDisconnect(device: BluetoothDevice) {
+        val hid = hidDevice ?: return
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                hid.sendReport(device, REPORT_ID_CONSUMER, byteArrayOf(0x01))
+                delay(65)
+                hid.sendReport(device, REPORT_ID_CONSUMER, byteArrayOf(0x00))
+                delay(800)
+                // Desconectamos HID después del disparo para que iOS jamás oculte su teclado virtual
+                hid.disconnect(device)
+            }
+        }
     }
 
     fun release() {

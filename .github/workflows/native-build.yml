@@ -42,7 +42,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-ios:
     name: iOS Native IPA (iPhone 16 Pro Max)
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4

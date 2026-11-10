@@ -10,6 +10,7 @@ import org.junit.Test
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
+import java.util.UUID
 
 class AncsParserTest {
 
@@ -224,6 +225,15 @@ class AncsParserTest {
         assertEquals("Bohemian Rhapsody", state.title)
         state = AmsEntityParser.applyEntityUpdate(state, amsUpdate(entity = 2, attr = 0, "Queen"))
         assertEquals("Queen", state.artist)
+    }
+
+    @Test
+    fun amsEntityAttributeUuid_matchesAppleMediaServiceSpec() {
+        // Apple Media Service Reference: Entity Attribute = C6B2F38C-23AB-46D8-A6AB-A3A870BBD5D7
+        assertEquals(
+            UUID.fromString("c6b2f38c-23ab-46d8-a6ab-a3a870bbd5d7"),
+            AppleBleUuids.AMS_ENTITY_ATTRIBUTE
+        )
     }
 
     @Test

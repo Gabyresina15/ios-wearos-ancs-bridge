@@ -210,7 +210,7 @@ class AncsBleService : LifecycleService() {
 
     private val gattQueue = ConcurrentLinkedQueue<GattOperation>()
     @Volatile private var inFlightOpId: Long = 0L
-    @Volatile private var pendingAmsTruncatedTarget: Pair<Int, Int>? = null
+    private val pendingAmsAttributeRequests = ConcurrentLinkedQueue<Pair<Int, Int>>()
     @Volatile private var isPassiveScanArmed: Boolean = false
 
     private val dataSourceCollector = AncsDataSourceCollector(
@@ -546,7 +546,7 @@ class AncsBleService : LifecycleService() {
             periodicSyncJob?.cancel()
             gattQueue.clear()
             inFlightOpId = 0L
-            pendingAmsTruncatedTarget = null
+            pendingAmsAttributeRequests.clear()
             isConnectingOrConnected = false
             servicesDiscoveryStarted = false
             remoteIosTelemetryChar = null
@@ -617,7 +617,7 @@ class AncsBleService : LifecycleService() {
     }
 
     private fun armPassiveHardwareScanIfNeeded(filters: List<ScanFilter>, settings: ScanSettings) {
-        if (isPassiveScanArmed || _connectionState.value == BleConnectionState.READY) return
+        if (isPassiveScanArmed || (activeGatt != null && _connectionState.value == BleConnectionState.READY)) return
         val result = runCatching {
             scanner?.startScan(filters, settings, buildPassiveScanPendingIntent())
         }.getOrNull()
@@ -627,9 +627,11 @@ class AncsBleService : LifecycleService() {
     }
 
     private fun stopPassiveHardwareScan() {
-        if (!isPassiveScanArmed) return
+        // Siempre se llama stopScan con el mismo PendingIntent: el flag in-memory se pierde
+        // si el proceso murió, y el scan del sistema puede seguir armado.
         isPassiveScanArmed = false
-        runCatching { scanner?.stopScan(buildPassiveScanPendingIntent()) }
+        val activeScanner = scanner ?: bluetoothManager.adapter?.bluetoothLeScanner
+        runCatching { activeScanner?.stopScan(buildPassiveScanPendingIntent()) }
     }
 
     private fun buildPassiveScanPendingIntent(): PendingIntent {
@@ -648,7 +650,7 @@ class AncsBleService : LifecycleService() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device ?: return
             stopActiveLowPowerScan()
-            if (_connectionState.value != BleConnectionState.READY && !isConnectingOrConnected) {
+            if ((activeGatt == null || _connectionState.value != BleConnectionState.READY) && !isConnectingOrConnected) {
                 connectToIphoneGatt(device, autoConnect = false)
             } else if (activeGatt != null && !_phoneContext.value.companionConnected && remoteIosCommandChar == null) {
                 runCatching { activeGatt?.discoverServices() }
@@ -1491,9 +1493,8 @@ class AncsBleService : LifecycleService() {
                     AppleBleUuids.CTS_CURRENT_TIME_CHAR -> handleCtsTimePayload(value)
                     AppleBleUuids.BAS_BATTERY_LEVEL_CHAR -> handleIphoneBatteryPayload(value)
                     AppleBleUuids.AMS_ENTITY_ATTRIBUTE -> {
-                        val target = pendingAmsTruncatedTarget
+                        val target = pendingAmsAttributeRequests.poll()
                         if (target != null && value.isNotEmpty()) {
-                            pendingAmsTruncatedTarget = null
                             _nowPlaying.update { current ->
                                 AmsEntityParser.applyFullEntityAttribute(current, target.first, target.second, value)
                             }
@@ -1547,7 +1548,7 @@ class AncsBleService : LifecycleService() {
     private fun requestFullAmsEntityAttribute(gatt: BluetoothGatt, entityId: Byte, attrId: Byte) {
         val entityAttrChar = gatt.getService(AppleBleUuids.AMS_SERVICE)
             ?.getCharacteristic(AppleBleUuids.AMS_ENTITY_ATTRIBUTE) ?: return
-        pendingAmsTruncatedTarget = (entityId.toInt() and 0xFF) to (attrId.toInt() and 0xFF)
+        pendingAmsAttributeRequests.add((entityId.toInt() and 0xFF) to (attrId.toInt() and 0xFF))
         enqueueGattOperation(
             GattOperation.WriteCharacteristic(
                 entityAttrChar,

@@ -8,6 +8,9 @@ struct AncsBridgeIOSApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .onOpenURL { url in
+                    healthManager.handleIncomingUrl(url)
+                }
         }
     }
 }

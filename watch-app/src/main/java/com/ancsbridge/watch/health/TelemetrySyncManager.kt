@@ -13,6 +13,7 @@ import androidx.health.connect.client.records.StepsRecord
 import androidx.health.connect.client.records.WeightRecord
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -24,8 +25,8 @@ import kotlin.math.max
 
 enum class HealthConnectStatus(val label: String) {
     UNKNOWN("Sensores Activos"),
-    READY("Salud + BIA Activo"),
-    PERMISSIONS_MISSING("Autorizar Peso/BIA"),
+    READY("Salud + Femmto Activo"),
+    PERMISSIONS_MISSING("Sensores Directos"),
     UNAVAILABLE("Sensores Directos OK")
 }
 
@@ -36,10 +37,17 @@ data class WatchTelemetrySnapshot(
     val latestHeartRateBpm: Long,
     val weightKg: Double?,
     val bodyFatPercentage: Double?,
+    val bmi: Double? = null,
+    val leanMassKg: Double? = null,
+    val bodyCompSource: String = "Femmto",
+    val bodyCompTimestamp: Long = 0L,
     val timestamp: Long = System.currentTimeMillis()
 )
 
-class TelemetrySyncManager(private val context: Context) {
+class TelemetrySyncManager(
+    private val context: Context,
+    scope: CoroutineScope
+) {
 
     companion object {
         private const val TAG = "TelemetrySyncManager"
@@ -53,14 +61,45 @@ class TelemetrySyncManager(private val context: Context) {
         )
     }
 
-    private val hardwareSensors = HardwareSensorMonitor(context).also { it.startListening() }
+    private val hardwareSensors = HardwareSensorMonitor(context, scope).also { it.startListening() }
     private val prefs = context.getSharedPreferences(PREFS_TELEMETRY, Context.MODE_PRIVATE)
 
     private val _healthStatus = MutableStateFlow(HealthConnectStatus.UNKNOWN)
     val healthStatus: StateFlow<HealthConnectStatus> = _healthStatus.asStateFlow()
 
+    val isMeasuringHr: StateFlow<Boolean> get() = hardwareSensors.isMeasuringHr
+
+    fun setOnHeartRateUpdatedListener(listener: (Long) -> Unit) {
+        hardwareSensors.onHeartRateUpdated = listener
+    }
+
+    fun triggerHeartRateMeasurement() {
+        hardwareSensors.triggerHeartRateBurst()
+    }
+
     fun release() {
         hardwareSensors.stopListening()
+    }
+
+    /**
+     * Guarda la composición corporal enviada desde la app del iPhone (balanza inteligente Femmto / Apple Salud).
+     */
+    fun saveBodyCompositionFromPhone(
+        weightKg: Double?,
+        bodyFatPct: Double?,
+        bmi: Double?,
+        leanMassKg: Double?,
+        source: String?,
+        measuredAtMillis: Long?
+    ) {
+        val editor = prefs.edit()
+        if (weightKg != null && weightKg > 15.0) editor.putFloat("last_weight_kg", weightKg.toFloat())
+        if (bodyFatPct != null && bodyFatPct > 1.0) editor.putFloat("last_body_fat_pct", bodyFatPct.toFloat())
+        if (bmi != null && bmi > 5.0) editor.putFloat("last_bmi", bmi.toFloat())
+        if (leanMassKg != null && leanMassKg > 5.0) editor.putFloat("last_lean_mass_kg", leanMassKg.toFloat())
+        if (!source.isNullOrBlank()) editor.putString("last_body_src", source)
+        if (measuredAtMillis != null && measuredAtMillis > 0L) editor.putLong("last_body_ts", measuredAtMillis)
+        editor.apply()
     }
 
     fun readBatteryState(): Pair<Int, Boolean> {
@@ -103,20 +142,21 @@ class TelemetrySyncManager(private val context: Context) {
         val (batteryPct, isCharging) = readBatteryState()
         val correctedNowMillis = System.currentTimeMillis() + clockDriftMillis
 
-        // 1. Lectura base directa desde los sensores físicos del Galaxy Watch 6
         var totalSteps = hardwareSensors.stepsToday
         var latestHr = hardwareSensors.latestHeartRateBpm
-        var latestWeightKg: Double? = prefs.getFloat("last_weight_kg", -1f).takeIf { it > 0f }?.toDouble()
-        var latestBodyFatPct: Double? = prefs.getFloat("last_body_fat_pct", -1f).takeIf { it > 0f }?.toDouble()
+        val latestWeightKg: Double? = prefs.getFloat("last_weight_kg", -1f).takeIf { it > 0f }?.toDouble()
+        val latestBodyFatPct: Double? = prefs.getFloat("last_body_fat_pct", -1f).takeIf { it > 0f }?.toDouble()
+        val latestBmi: Double? = prefs.getFloat("last_bmi", -1f).takeIf { it > 0f }?.toDouble()
+        val latestLeanMass: Double? = prefs.getFloat("last_lean_mass_kg", -1f).takeIf { it > 0f }?.toDouble()
+        val bodySource = prefs.getString("last_body_src", "Femmto") ?: "Femmto"
+        val bodyTs = prefs.getLong("last_body_ts", 0L)
 
-        // 2. Enriquecimiento opcional con Health Connect (Samsung Health: Peso, BIA, Pasos y FC)
         val status = checkHealthConnectPermissions()
         if (status == HealthConnectStatus.READY) {
             runCatching {
                 val client = HealthConnectClient.getOrCreate(context)
                 val now = Instant.now()
                 val startOfDay = ZonedDateTime.now().truncatedTo(ChronoUnit.DAYS).toInstant()
-                val last30Days = now.minus(30, ChronoUnit.DAYS)
 
                 val stepsResponse = client.readRecords(
                     ReadRecordsRequest(
@@ -137,35 +177,9 @@ class TelemetrySyncManager(private val context: Context) {
                     .flatMap { it.samples }
                     .maxByOrNull { it.time }
                     ?.beatsPerMinute ?: 0L
-                if (hcHr > 0L) latestHr = hcHr
-
-                val weightResponse = client.readRecords(
-                    ReadRecordsRequest(
-                        recordType = WeightRecord::class,
-                        timeRangeFilter = TimeRangeFilter.between(last30Days, now)
-                    )
-                )
-                weightResponse.records
-                    .maxByOrNull { it.time }
-                    ?.weight?.inKilograms?.let { w ->
-                        latestWeightKg = w
-                        prefs.edit().putFloat("last_weight_kg", w.toFloat()).apply()
-                    }
-
-                val bodyFatResponse = client.readRecords(
-                    ReadRecordsRequest(
-                        recordType = BodyFatRecord::class,
-                        timeRangeFilter = TimeRangeFilter.between(last30Days, now)
-                    )
-                )
-                bodyFatResponse.records
-                    .maxByOrNull { it.time }
-                    ?.percentage?.value?.let { bf ->
-                        latestBodyFatPct = bf
-                        prefs.edit().putFloat("last_body_fat_pct", bf.toFloat()).apply()
-                    }
+                if (hcHr > 0L && latestHr == 0L) latestHr = hcHr
             }.onFailure { err ->
-                Log.w(TAG, "Usando sensores directos (Health Connect no respondió): ${err.message}")
+                Log.w(TAG, "Usando sensores directos: ${err.message}")
             }
         }
 
@@ -182,13 +196,16 @@ class TelemetrySyncManager(private val context: Context) {
             latestHeartRateBpm = latestHr,
             weightKg = latestWeightKg,
             bodyFatPercentage = latestBodyFatPct,
+            bmi = latestBmi,
+            leanMassKg = latestLeanMass,
+            bodyCompSource = bodySource,
+            bodyCompTimestamp = bodyTs,
             timestamp = correctedNowMillis
         )
     }
 
     /**
-     * Serializa el snapshot en formato JSON compacto (<160 bytes) para enviarlo en 1 paquete BLE GATT
-     * a través de la característica BRIDGE_TELEMETRY_CHAR hacia la app nativa de iOS o Android.
+     * Serializa el snapshot en formato JSON compacto (<140 bytes) para transmisión BLE GATT.
      */
     fun toBleJson(
         snapshot: WatchTelemetrySnapshot,
@@ -201,12 +218,10 @@ class TelemetrySyncManager(private val context: Context) {
             put("chg", snapshot.isCharging)
             put("steps", snapshot.stepsToday)
             put("hr", snapshot.latestHeartRateBpm)
-            put("wt", snapshot.weightKg ?: JSONObject.NULL)
-            put("fat", snapshot.bodyFatPercentage ?: JSONObject.NULL)
             put("dnd", isWatchMuted)
             put("hfp", isHfpConnected)
             put("hid", isHidConnected)
-            put("model", android.os.Build.MODEL)
+            put("model", "Galaxy Watch 6 Classic")
             put("ts", snapshot.timestamp)
         }.toString()
     }

@@ -17,15 +17,12 @@ import androidx.wear.tiles.TileService
 import com.ancsbridge.watch.ui.MainActivity
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
+import java.util.Locale
 
-/**
- * Tile nativo de Wear OS para visualizar de un vistazo el estado del enlace con el iPhone/Android,
- * batería del teléfono, pasos del día y frecuencia cardíaca.
- */
 class BridgeStatusTileService : TileService() {
 
     companion object {
-        private const val RESOURCES_VERSION = "1"
+        private const val RESOURCES_VERSION = "2"
         private const val PREFS_BLE = "ancs_bridge_prefs"
         private const val PREFS_TELEMETRY = "ancs_telemetry_cache"
 
@@ -40,11 +37,15 @@ class BridgeStatusTileService : TileService() {
         val blePrefs = getSharedPreferences(PREFS_BLE, Context.MODE_PRIVATE)
         val telPrefs = getSharedPreferences(PREFS_TELEMETRY, Context.MODE_PRIVATE)
 
-        val phoneName = blePrefs.getString("last_iphone_real_name", "Teléfono") ?: "Teléfono"
+        val phoneName = blePrefs.getString("last_iphone_real_name", "iPhone") ?: "iPhone"
         val connLabel = blePrefs.getString("last_conn_state_label", "Conectado") ?: "Conectado"
         val phoneBatt = blePrefs.getInt("last_iphone_battery", -1)
+        val isMuted = blePrefs.getBoolean("watch_notifications_muted", false)
+
         val steps = telPrefs.getLong("last_steps", 0L)
         val hrBpm = telPrefs.getLong("last_hr_bpm", 0L)
+        val weightKg = telPrefs.getFloat("last_weight_kg", -1f)
+        val fatPct = telPrefs.getFloat("last_body_fat_pct", -1f)
 
         val openAppAction = ModifiersBuilders.Clickable.Builder()
             .setId("open_bridge_app")
@@ -60,8 +61,15 @@ class BridgeStatusTileService : TileService() {
             )
             .build()
 
-        val batteryText = if (phoneBatt in 0..100) "$connLabel • $phoneBatt%" else connLabel
-        val hrText = if (hrBpm > 0) "$hrBpm BPM" else "-- BPM"
+        val batteryText = if (phoneBatt in 0..100) "$connLabel • 🔋 $phoneBatt%" else connLabel
+        val hrText = if (hrBpm > 0) "❤️ $hrBpm BPM" else "❤️ --"
+        val femmtoLine = buildString {
+            if (weightKg > 0f) append(String.format(Locale.US, "⚖️ %.1f kg", weightKg))
+            if (fatPct > 0f) {
+                if (isNotEmpty()) append(" • ")
+                append(String.format(Locale.US, "%.1f%% grasa", fatPct))
+            }
+        }.ifEmpty { if (isMuted) "🔕 Notificaciones pausadas" else "🔔 Notificaciones activas" }
 
         val rootLayout = LayoutElementBuilders.Box.Builder()
             .setWidth(expand())
@@ -70,7 +78,7 @@ class BridgeStatusTileService : TileService() {
                 ModifiersBuilders.Modifiers.Builder()
                     .setBackground(
                         ModifiersBuilders.Background.Builder()
-                            .setColor(argb(0xFF0A0A0C.toInt()))
+                            .setColor(argb(0xFF0A0A0E.toInt()))
                             .build()
                     )
                     .setClickable(openAppAction)
@@ -93,44 +101,38 @@ class BridgeStatusTileService : TileService() {
                             )
                             .build()
                     )
-                    .addContent(
-                        LayoutElementBuilders.Spacer.Builder().setHeight(dp(4f)).build()
-                    )
+                    .addContent(LayoutElementBuilders.Spacer.Builder().setHeight(dp(3f)).build())
                     .addContent(
                         LayoutElementBuilders.Text.Builder()
                             .setText(batteryText)
                             .setFontStyle(
                                 LayoutElementBuilders.FontStyle.Builder()
+                                    .setSize(sp(11f))
+                                    .setColor(argb(0xFF10B981.toInt()))
+                                    .build()
+                            )
+                            .build()
+                    )
+                    .addContent(LayoutElementBuilders.Spacer.Builder().setHeight(dp(8f)).build())
+                    .addContent(
+                        LayoutElementBuilders.Text.Builder()
+                            .setText("👟 $steps pasos  •  $hrText")
+                            .setFontStyle(
+                                LayoutElementBuilders.FontStyle.Builder()
                                     .setSize(sp(12f))
-                                    .setColor(argb(0xFF34D399.toInt()))
+                                    .setColor(argb(0xFF06B6D4.toInt()))
                                     .build()
                             )
                             .build()
                     )
-                    .addContent(
-                        LayoutElementBuilders.Spacer.Builder().setHeight(dp(10f)).build()
-                    )
+                    .addContent(LayoutElementBuilders.Spacer.Builder().setHeight(dp(6f)).build())
                     .addContent(
                         LayoutElementBuilders.Text.Builder()
-                            .setText("$steps pasos  •  $hrText")
+                            .setText(femmtoLine)
                             .setFontStyle(
                                 LayoutElementBuilders.FontStyle.Builder()
-                                    .setSize(sp(13f))
-                                    .setColor(argb(0xFF38BDF8.toInt()))
-                                    .build()
-                            )
-                            .build()
-                    )
-                    .addContent(
-                        LayoutElementBuilders.Spacer.Builder().setHeight(dp(8f)).build()
-                    )
-                    .addContent(
-                        LayoutElementBuilders.Text.Builder()
-                            .setText("Tocar para abrir controles")
-                            .setFontStyle(
-                                LayoutElementBuilders.FontStyle.Builder()
-                                    .setSize(sp(10f))
-                                    .setColor(argb(0xFF71717A.toInt()))
+                                    .setSize(sp(11f))
+                                    .setColor(argb(if (isMuted) 0xFFF87171.toInt() else 0xFFA1A1AA.toInt()))
                                     .build()
                             )
                             .build()
@@ -142,9 +144,7 @@ class BridgeStatusTileService : TileService() {
         val tile = TileBuilders.Tile.Builder()
             .setResourcesVersion(RESOURCES_VERSION)
             .setFreshnessIntervalMillis(60_000L)
-            .setTileTimeline(
-                TimelineBuilders.Timeline.fromLayoutElement(rootLayout)
-            )
+            .setTileTimeline(TimelineBuilders.Timeline.fromLayoutElement(rootLayout))
             .build()
 
         return Futures.immediateFuture(tile)

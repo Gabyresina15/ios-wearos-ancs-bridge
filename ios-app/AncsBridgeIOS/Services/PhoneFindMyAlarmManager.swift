@@ -17,8 +17,10 @@ final class PhoneFindMyAlarmManager: ObservableObject {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
     }
 
-    /// Activa una alarma sonora sintetizada por el altavoz del iPhone (ignorando el interruptor de silencio)
-    /// y hace parpadear el flash LED trasero cuando el reloj envía el comando FIND_PHONE por BLE.
+    func startAlarm() {
+        triggerFindPhoneAlarm()
+    }
+
     func triggerFindPhoneAlarm() {
         if isRinging {
             stopAlarm()
@@ -113,8 +115,8 @@ final class PhoneFindMyAlarmManager: ObservableObject {
     private func postLocalFindPhoneNotification() {
         let content = UNMutableNotificationContent()
         content.title = "⌚ Galaxy Watch 6 está buscando tu iPhone"
-        content.body = "Abre la app para detener la alarma sonora y el flash."
-        content.sound = .defaultCritical
+        content.body = "Tocá para abrir Watch Bridge y detener la sirena y el flash."
+        content.sound = .default
 
         let request = UNNotificationRequest(
             identifier: "find_my_iphone_alert",

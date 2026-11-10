@@ -5,14 +5,24 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import java.time.LocalDate
 
 /**
  * Monitor directo de sensores de hardware del Galaxy Watch 6 (TYPE_STEP_COUNTER y TYPE_HEART_RATE).
- * Garantiza lecturas reales de pasos y frecuencia cardíaca en tiempo real incluso cuando
- * Health Connect no está instalado o configurado en un reloj vinculado a iOS.
+ * Soporta medición continua de pasos y ráfagas de alta precisión bajo demanda para el sensor óptico PPG.
  */
-class HardwareSensorMonitor(context: Context) : SensorEventListener {
+class HardwareSensorMonitor(
+    context: Context,
+    private val scope: CoroutineScope
+) : SensorEventListener {
 
     companion object {
         private const val PREFS_NAME = "watch_hw_sensors_prefs"
@@ -34,7 +44,12 @@ class HardwareSensorMonitor(context: Context) : SensorEventListener {
     var latestHeartRateBpm: Long = prefs.getLong(KEY_CACHED_HR_BPM, 0L)
         private set
 
+    private val _isMeasuringHr = MutableStateFlow(false)
+    val isMeasuringHr: StateFlow<Boolean> = _isMeasuringHr.asStateFlow()
+
     private var isListening = false
+    private var burstJob: Job? = null
+    var onHeartRateUpdated: ((Long) -> Unit)? = null
 
     fun startListening() {
         if (isListening) return
@@ -49,7 +64,34 @@ class HardwareSensorMonitor(context: Context) : SensorEventListener {
         }
     }
 
+    /**
+     * Activa una medición activa de pulso de 14 segundos a máxima frecuencia (SENSOR_DELAY_FASTEST)
+     * cuando el usuario toca "Medir pulso" en el reloj o en la app del iPhone.
+     */
+    fun triggerHeartRateBurst() {
+        val sm = sensorManager ?: return
+        val hrSensor = sm.getDefaultSensor(Sensor.TYPE_HEART_RATE) ?: return
+
+        _isMeasuringHr.value = true
+        runCatching {
+            sm.unregisterListener(this, hrSensor)
+            sm.registerListener(this, hrSensor, SensorManager.SENSOR_DELAY_FASTEST)
+        }
+
+        burstJob?.cancel()
+        burstJob = scope.launch(Dispatchers.Main) {
+            delay(14_000L)
+            _isMeasuringHr.value = false
+            runCatching {
+                sm.unregisterListener(this@HardwareSensorMonitor, hrSensor)
+                sm.registerListener(this@HardwareSensorMonitor, hrSensor, SensorManager.SENSOR_DELAY_NORMAL)
+            }
+        }
+    }
+
     fun stopListening() {
+        burstJob?.cancel()
+        _isMeasuringHr.value = false
         if (!isListening) return
         sensorManager?.unregisterListener(this)
         isListening = false
@@ -84,6 +126,10 @@ class HardwareSensorMonitor(context: Context) : SensorEventListener {
                 if (bpm in 30L..240L) {
                     latestHeartRateBpm = bpm
                     prefs.edit().putLong(KEY_CACHED_HR_BPM, bpm).apply()
+                    if (_isMeasuringHr.value) {
+                        _isMeasuringHr.value = false
+                    }
+                    onHeartRateUpdated?.invoke(bpm)
                 }
             }
         }

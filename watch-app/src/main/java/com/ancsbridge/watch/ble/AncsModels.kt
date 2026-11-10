@@ -12,6 +12,7 @@ object AppleBleUuids {
     val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     val GENERIC_HEART_RATE_SERVICE: UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
+    val HEART_RATE_MEASUREMENT_CHAR: UUID = UUID.fromString("00002a37-0000-1000-8000-00805f9b34fb")
 
     val GAP_SERVICE: UUID = UUID.fromString("00001800-0000-1000-8000-00805f9b34fb")
     val GAP_DEVICE_NAME_CHAR: UUID = UUID.fromString("00002a00-0000-1000-8000-00805f9b34fb")
@@ -72,7 +73,7 @@ object AppleDeviceModelResolver {
 
         return when {
             resolvedModel != null && cleanName != null && !cleanName.equals("iPhone", ignoreCase = true) ->
-                "$cleanName ($resolvedModel)"
+                cleanName
             resolvedModel != null -> resolvedModel
             cleanName != null -> cleanName
             else -> "iPhone vinculado"

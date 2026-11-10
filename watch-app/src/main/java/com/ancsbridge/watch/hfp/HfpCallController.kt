@@ -7,7 +7,6 @@ import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.media.AudioManager
 import android.telecom.TelecomManager
-import android.util.Log
 import android.view.KeyEvent
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -19,7 +18,6 @@ class HfpCallController(
     private val adapter: BluetoothAdapter?
 ) {
     companion object {
-        private const val TAG = "HfpCallController"
         private const val PROFILE_HEADSET_CLIENT = 16
     }
 
@@ -35,6 +33,7 @@ class HfpCallController(
         override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
             if (profile == PROFILE_HEADSET_CLIENT) {
                 headsetClientProxy = proxy
+                targetDevice?.let { tryConnectHfpIfNeeded(proxy, it) }
                 refreshConnectionState()
             }
         }
@@ -53,7 +52,19 @@ class HfpCallController(
 
     fun bindToIphone(device: BluetoothDevice) {
         targetDevice = device
+        headsetClientProxy?.let { tryConnectHfpIfNeeded(it, device) }
         refreshConnectionState()
+    }
+
+    private fun tryConnectHfpIfNeeded(proxy: BluetoothProfile, device: BluetoothDevice) {
+        runCatching {
+            if (device.bondState == BluetoothDevice.BOND_BONDED &&
+                proxy.getConnectionState(device) == BluetoothProfile.STATE_DISCONNECTED
+            ) {
+                val connectMethod = proxy.javaClass.getMethod("connect", BluetoothDevice::class.java)
+                connectMethod.invoke(proxy, device)
+            }
+        }
     }
 
     fun refreshConnectionState() {
@@ -71,8 +82,18 @@ class HfpCallController(
     }
 
     fun answerIncomingCall(): Boolean {
+        enableWatchScoAudio()
+        val proxy = headsetClientProxy
+        val device = targetDevice ?: proxy?.connectedDevices?.firstOrNull()
+        if (proxy != null && device != null) {
+            val acceptedViaHfp = runCatching {
+                val m = proxy.javaClass.getMethod("acceptCall", BluetoothDevice::class.java, Int::class.javaPrimitiveType)
+                m.invoke(proxy, device, 0) as? Boolean ?: true
+            }.getOrDefault(false)
+            if (acceptedViaHfp) return true
+        }
+
         return runCatching {
-            enableWatchScoAudio()
             @Suppress("DEPRECATION")
             telecomManager.acceptRingingCall()
             true
@@ -82,6 +103,15 @@ class HfpCallController(
     }
 
     fun rejectOrHangupCall(): Boolean {
+        val proxy = headsetClientProxy
+        val device = targetDevice ?: proxy?.connectedDevices?.firstOrNull()
+        if (proxy != null && device != null) {
+            runCatching {
+                val rejectMethod = proxy.javaClass.getMethod("rejectCall", BluetoothDevice::class.java)
+                rejectMethod.invoke(proxy, device)
+            }
+        }
+
         return runCatching {
             @Suppress("DEPRECATION")
             val ended = telecomManager.endCall()
@@ -105,13 +135,16 @@ class HfpCallController(
 
     private fun enableWatchScoAudio() {
         audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+        @Suppress("DEPRECATION")
         audioManager.startBluetoothSco()
         audioManager.isBluetoothScoOn = true
+        @Suppress("DEPRECATION")
         audioManager.isSpeakerphoneOn = true
     }
 
     private fun disableWatchScoAudio() {
         audioManager.isBluetoothScoOn = false
+        @Suppress("DEPRECATION")
         audioManager.stopBluetoothSco()
         audioManager.mode = AudioManager.MODE_NORMAL
     }

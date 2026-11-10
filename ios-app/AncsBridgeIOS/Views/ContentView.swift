@@ -85,13 +85,14 @@ struct ContentView: View {
                 Text("Alarma de búsqueda activa")
                     .font(.headline)
                     .foregroundStyle(.white)
-                Text("Disparada desde tu Galaxy Watch 6 Classic")
+                Text("Disparada desde \(ble.watchName)")
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.85))
             }
             Spacer()
             Button("Detener") {
                 alarm.stopAlarm()
+                ble.notifyPhoneAlarmStopped()
             }
             .buttonStyle(.borderedProminent)
             .tint(.black)
@@ -195,7 +196,7 @@ struct ContentView: View {
                 HStack(spacing: 10) {
                     Image(systemName: "info.circle.fill")
                         .foregroundStyle(accentCyan)
-                    Text("Abrí la app Watch Bridge en tu reloj o tocá Reconectar para enlazar al instante.")
+                    Text("Abrí la app Watch Bridge en \(ble.watchName) o tocá Conectar para enlazar al instante.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -232,17 +233,17 @@ struct ContentView: View {
                 }
 
                 Button {
-                    ble.findWatch()
+                    ble.toggleFindWatch()
                 } label: {
                     HStack(spacing: 6) {
-                        Image(systemName: "bell.and.waves.left.and.right.fill")
-                        Text("Buscar reloj")
+                        Image(systemName: ble.isRingingWatch ? "speaker.slash.fill" : "bell.and.waves.left.and.right.fill")
+                        Text(ble.isRingingWatch ? "Parar alarma" : "Buscar reloj")
                     }
                     .font(.caption.bold())
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 11)
-                    .background(cardElevated)
-                    .foregroundStyle(accentCyan)
+                    .background(ble.isRingingWatch ? accentCoral.opacity(0.25) : cardElevated)
+                    .foregroundStyle(ble.isRingingWatch ? accentCoral : accentCyan)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
                 }
             }
@@ -275,8 +276,8 @@ struct ContentView: View {
                     .font(.subheadline.bold())
                     .foregroundStyle(.white)
                 Text(isMuted
-                     ? "No saldrán alertas ni el punto naranja en tu Galaxy Watch hasta que lo actives."
-                     : "Los mensajes de tu iPhone aparecen y vibran en tu muñeca.")
+                     ? "No saldrán alertas ni el punto naranja en \(ble.watchName) hasta que lo actives."
+                     : "Los mensajes aparecen y vibran en \(ble.watchName).")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -334,7 +335,7 @@ struct ContentView: View {
 
             quickActionButton(
                 title: "Probar Sirena",
-                subtitle: alarm.isRinging ? "Detener alarma" : "Alarma Buscar iPhone",
+                subtitle: alarm.isRinging ? "Detener alarma" : "Alarma local iOS",
                 icon: "megaphone.fill",
                 tint: accentEmerald
             ) {
@@ -382,7 +383,7 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Control Multimedia
+    // MARK: - Control Multimedia Sincronizado (AMS)
 
     private var mediaRemoteCard: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -391,9 +392,26 @@ struct ContentView: View {
                     .font(.caption.bold())
                     .foregroundStyle(.secondary)
                 Spacer()
-                Text("iPhone ↔ Reloj")
-                    .font(.caption2)
-                    .foregroundStyle(accentCyan)
+                if let vol = ble.telemetry.mVol {
+                    Text("🔊 \(vol)%")
+                        .font(.caption2.bold())
+                        .foregroundStyle(accentCyan)
+                } else {
+                    Text(ble.watchName)
+                        .font(.caption2)
+                        .foregroundStyle(accentCyan)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(ble.telemetry.mTitle)
+                    .font(.subheadline.bold())
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                Text(ble.telemetry.mArtist)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
 
             HStack(spacing: 10) {
@@ -402,7 +420,7 @@ struct ContentView: View {
                 Button {
                     ble.sendMediaCommand("TOGGLE_PLAY_PAUSE")
                 } label: {
-                    Image(systemName: "playpause.fill")
+                    Image(systemName: ble.telemetry.mPlay ? "pause.fill" : "play.fill")
                         .font(.body.bold())
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 12)
@@ -470,9 +488,10 @@ struct ContentView: View {
 
         return VStack(alignment: .leading, spacing: 14) {
             HStack {
-                Label("Actividad del Galaxy Watch 6", systemImage: "figure.run.circle.fill")
+                Label("Actividad de \(ble.watchName)", systemImage: "figure.run.circle.fill")
                     .font(.subheadline.bold())
                     .foregroundStyle(.white)
+                    .lineLimit(1)
                 Spacer()
                 Button {
                     ble.measureWatchHeartRate()
@@ -554,11 +573,11 @@ struct ContentView: View {
                             .foregroundStyle(.white)
                     }
                     if let measuredAt = comp.measuredAt {
-                        Text("Última pesada: \(measuredAt.formatted(date: .abbreviated, time: .shortened)) • Sincronizado con el reloj")
+                        Text("Última pesada: \(measuredAt.formatted(date: .abbreviated, time: .shortened)) • Sincronizado con \(ble.watchName)")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     } else {
-                        Text("Sincronizá desde Salud o cargá tu pesada de Femmto para verla en el reloj")
+                        Text("Sincronizá desde Salud o cargá tu pesada de Femmto para verla en \(ble.watchName)")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -651,7 +670,7 @@ struct ContentView: View {
                     .font(.caption.bold())
                     .foregroundStyle(.white)
             }
-            Text("Si en la app Atajos de tu iPhone creás una Automatización personal 'Al cerrar la app Femmto' → 'Buscar muestras de Salud (Peso y % Grasa)' → 'Abrir URL':")
+            Text("Si en la app Atajos creás una Automatización personal 'Al cerrar la app Femmto' → 'Buscar muestras de Salud (Peso y % Grasa)' → 'Abrir URL':")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             Text("watchbridge://femmto?wt=[Peso]&fat=[Grasa]")
@@ -706,14 +725,14 @@ struct ContentView: View {
                     } label: {
                         HStack {
                             Spacer()
-                            Label("Guardar y enviar al Galaxy Watch", systemImage: "paperplane.fill")
+                            Label("Guardar y enviar a \(ble.watchName)", systemImage: "paperplane.fill")
                                 .font(.subheadline.bold())
                             Spacer()
                         }
                     }
                     .tint(accentEmerald)
                 } footer: {
-                    Text("Calcula automáticamente tu IMC y tu Masa Magra y actualiza la tarjeta de Femmto en tu Galaxy Watch 6 Classic.")
+                    Text("Calcula automáticamente tu IMC y tu Masa Magra y actualiza la tarjeta de Femmto en \(ble.watchName).")
                 }
             }
             .navigationTitle("Balanza Femmto")
@@ -819,9 +838,9 @@ struct ContentView: View {
                         .padding(.vertical, 2)
                     }
                 } header: {
-                    Text("Aplicaciones permitidas en tu Galaxy Watch")
+                    Text("Aplicaciones permitidas en \(ble.watchName)")
                 } footer: {
-                    Text("Cualquier aplicación nueva que envíe una notificación a tu iPhone se agregará sola a esta lista para que puedas bloquearla si no querés que salga en el reloj.")
+                    Text("El reloj consulta automáticamente a iOS el nombre oficial de cada aplicación mediante el comando nativo ANCS GetAppAttributes (0x01) y la agrega a esta lista.")
                 }
             }
             .searchable(text: $appSearchText, prompt: "Buscar aplicación...")
@@ -847,7 +866,7 @@ struct ContentView: View {
                         Text("Sin notificaciones recientes")
                             .font(.headline)
                             .foregroundStyle(.white)
-                        Text("Aquí verás el registro en vivo de los mensajes recibidos en tu Galaxy Watch 6 Classic.")
+                        Text("Aquí verás el registro en vivo de los mensajes recibidos en \(ble.watchName).")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)

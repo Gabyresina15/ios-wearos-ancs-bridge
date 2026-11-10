@@ -1,5 +1,6 @@
 import Foundation
 import CoreBluetooth
+import Darwin
 
 // MARK: - UUIDs del canal BLE directo (deben coincidir con AppleBleUuids del reloj)
 
@@ -10,6 +11,57 @@ enum BridgeBleUUIDs {
     static let watchEventChar = CBUUID(string: "D973F2E3-B19E-11E2-9E96-0800200C9A66")
 
     static let genericHeartRateService = CBUUID(string: "180D")
+}
+
+// MARK: - Resolución Dinámica de Hardware (Cero Nombres Hardcodeados)
+
+enum DeviceHardwareResolver {
+    private static let watchModels: [String: String] = [
+        "SM-R960": "Galaxy Watch6 Classic",
+        "SM-R965": "Galaxy Watch6 Classic",
+        "SM-R950": "Galaxy Watch6 Classic",
+        "SM-R955": "Galaxy Watch6 Classic",
+        "SM-R940": "Galaxy Watch6",
+        "SM-R945": "Galaxy Watch6",
+        "SM-R930": "Galaxy Watch6",
+        "SM-R935": "Galaxy Watch6",
+        "SM-L310": "Galaxy Watch7",
+        "SM-L315": "Galaxy Watch7",
+        "SM-L300": "Galaxy Watch7",
+        "SM-L305": "Galaxy Watch7",
+        "SM-L705": "Galaxy Watch Ultra",
+        "SM-R920": "Galaxy Watch5 Pro",
+        "SM-R925": "Galaxy Watch5 Pro",
+        "SM-R910": "Galaxy Watch5",
+        "SM-R900": "Galaxy Watch5",
+        "SM-R890": "Galaxy Watch4 Classic",
+        "SM-R880": "Galaxy Watch4 Classic",
+        "SM-R870": "Galaxy Watch4",
+        "SM-R860": "Galaxy Watch4"
+    ]
+
+    /// Obtiene el identificador exacto de máquina del kernel Darwin (ej. "iPhone17,2")
+    static func currentMachineIdentifier() -> String {
+        var sysinfo = utsname()
+        uname(&sysinfo)
+        let machineMirror = Mirror(reflecting: sysinfo.machine)
+        let identifier = machineMirror.children.reduce("") { id, element in
+            guard let value = element.value as? Int8, value != 0 else { return id }
+            return id + String(UnicodeScalar(UInt8(value)))
+        }
+        return identifier.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Normaliza o traduce dinámicamente el nombre real reportado por el reloj
+    static func normalizeWatchName(_ raw: String) -> String? {
+        let clean = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return nil }
+        let prefix = String(clean.prefix(7)).uppercased()
+        if let mapped = watchModels[prefix] {
+            return mapped
+        }
+        return clean
+    }
 }
 
 // MARK: - Estado de conexión
@@ -48,13 +100,17 @@ struct WatchTelemetryPayload: Decodable, Equatable {
     var dnd: Bool = false
     var hfp: Bool = false
     var hid: Bool = false
-    var model: String = "Galaxy Watch"
+    var model: String = ""
+    var mTitle: String = "Sin reproducción"
+    var mArtist: String = "Control multimedia"
+    var mPlay: Bool = false
+    var mVol: Int? = nil
     var ts: Int64 = 0
 
     init() {}
 
     enum CodingKeys: String, CodingKey {
-        case bat, chg, steps, hr, dnd, hfp, hid, model, ts
+        case bat, chg, steps, hr, dnd, hfp, hid, model, mTitle, mArtist, mPlay, mVol, ts
     }
 
     init(from decoder: Decoder) throws {
@@ -66,7 +122,11 @@ struct WatchTelemetryPayload: Decodable, Equatable {
         dnd = (try? c.decodeIfPresent(Bool.self, forKey: .dnd)) ?? false
         hfp = (try? c.decodeIfPresent(Bool.self, forKey: .hfp)) ?? false
         hid = (try? c.decodeIfPresent(Bool.self, forKey: .hid)) ?? false
-        model = (try? c.decodeIfPresent(String.self, forKey: .model)) ?? "Galaxy Watch"
+        model = (try? c.decodeIfPresent(String.self, forKey: .model)) ?? ""
+        mTitle = (try? c.decodeIfPresent(String.self, forKey: .mTitle)) ?? "Sin reproducción"
+        mArtist = (try? c.decodeIfPresent(String.self, forKey: .mArtist)) ?? "Control multimedia"
+        mPlay = (try? c.decodeIfPresent(Bool.self, forKey: .mPlay)) ?? false
+        mVol = try? c.decodeIfPresent(Int.self, forKey: .mVol)
         ts = (try? c.decodeIfPresent(Int64.self, forKey: .ts)) ?? 0
     }
 
@@ -104,7 +164,7 @@ struct WatchNotificationLogItem: Identifiable, Decodable, Equatable {
     var id: Int { uid }
     let uid: Int
     let app: String
-    let appName: String
+    var appName: String
     let title: String
     let msg: String
     let ts: Int64
@@ -128,7 +188,7 @@ struct WatchNotificationLogItem: Identifiable, Decodable, Equatable {
 
 struct IosAppFilterCatalogItem: Identifiable, Equatable {
     var id: String { bundleId }
-    let name: String
+    var name: String
     let bundleId: String
     let symbol: String
 

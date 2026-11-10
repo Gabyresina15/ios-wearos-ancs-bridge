@@ -42,7 +42,7 @@
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
-        android:label="ANCS Bridge"
+        android:label="Watch Bridge"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.DeviceDefault">
 
@@ -95,7 +95,10 @@
             <intent-filter>
                 <action android:name="com.ancsbridge.watch.ACTION_PASSIVE_BLE_FOUND" />
                 <action android:name="com.ancsbridge.watch.ACTION_NOTIFICATION_ACTION" />
+                <action android:name="android.bluetooth.device.action.ACL_CONNECTED" />
+                <action android:name="android.bluetooth.adapter.action.STATE_CHANGED" />
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
 

@@ -16,8 +16,9 @@ import kotlinx.coroutines.launch
 import java.time.LocalDate
 
 /**
- * Monitor directo de sensores de hardware del Galaxy Watch 6 (TYPE_STEP_COUNTER y TYPE_HEART_RATE).
- * Soporta medición continua de pasos y ráfagas de alta precisión bajo demanda para el sensor óptico PPG.
+ * Monitor directo de sensores de hardware del reloj Wear OS (TYPE_STEP_COUNTER y TYPE_HEART_RATE).
+ * Soporta medición continua de pasos con notificación en tiempo real y ráfagas de alta precisión
+ * bajo demanda para el sensor óptico PPG.
  */
 class HardwareSensorMonitor(
     context: Context,
@@ -30,6 +31,7 @@ class HardwareSensorMonitor(
         private const val KEY_BASELINE_COUNT = "step_baseline_raw"
         private const val KEY_CACHED_TODAY_STEPS = "step_cached_today"
         private const val KEY_CACHED_HR_BPM = "hr_cached_bpm"
+        private const val STEP_PUSH_THROTTLE_MS = 3_500L
     }
 
     private val appContext = context.applicationContext
@@ -49,7 +51,10 @@ class HardwareSensorMonitor(
 
     private var isListening = false
     private var burstJob: Job? = null
+    private var lastStepNotifyMillis = 0L
+
     var onHeartRateUpdated: ((Long) -> Unit)? = null
+    var onStepsUpdated: ((Long) -> Unit)? = null
 
     fun startListening() {
         if (isListening) return
@@ -117,8 +122,15 @@ class HardwareSensorMonitor(
                 }
 
                 val computedSteps = (totalSinceBoot - baseline).coerceAtLeast(0L)
+                val changed = computedSteps != stepsToday
                 stepsToday = computedSteps
                 prefs.edit().putLong(KEY_CACHED_TODAY_STEPS, computedSteps).apply()
+
+                val now = System.currentTimeMillis()
+                if (changed && now - lastStepNotifyMillis >= STEP_PUSH_THROTTLE_MS) {
+                    lastStepNotifyMillis = now
+                    onStepsUpdated?.invoke(computedSteps)
+                }
             }
 
             Sensor.TYPE_HEART_RATE -> {

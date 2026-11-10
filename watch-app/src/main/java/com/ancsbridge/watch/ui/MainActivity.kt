@@ -158,6 +158,10 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
         ?: remember { mutableStateOf(false) }
     val isMeasuringHr by service?.isMeasuringHr?.collectAsState()
         ?: remember { mutableStateOf(false) }
+    val isFindingPhone by service?.isFindingPhone?.collectAsState()
+        ?: remember { mutableStateOf(false) }
+    val isWatchRinging by service?.isWatchRinging?.collectAsState()
+        ?: remember { mutableStateOf(false) }
 
     var selectedNotification by remember { mutableStateOf<AncsNotification?>(null) }
 
@@ -286,7 +290,7 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
                                         text = if (isWatchMuted) {
                                             "No saldrán mensajes ni el punto naranja hasta que las actives."
                                         } else {
-                                            "Los mensajes de tu iPhone aparecerán aquí."
+                                            "Los mensajes de $phoneName aparecerán aquí."
                                         },
                                         fontSize = 10.sp,
                                         color = TextSecondary,
@@ -496,7 +500,7 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
                             }
                         }
 
-                        // 4. Acciones Rápidas: Cámara • Buscar iPhone • Bandeja
+                        // 4. Acciones Rápidas: Cámara • Buscar iPhone (con parada directa desde el reloj)
                         item {
                             Row(
                                 modifier = Modifier.fillMaxWidth(0.92f),
@@ -512,18 +516,24 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
                                     Text("📸 Cámara", fontSize = 10.sp, color = AccentCyan)
                                 }
                                 Button(
-                                    onClick = { service?.ringMyIphone() },
+                                    onClick = { service?.toggleFindMyIphone() },
                                     modifier = Modifier
                                         .weight(1f)
                                         .height(36.dp),
-                                    colors = ButtonDefaults.buttonColors(backgroundColor = CardSurface)
+                                    colors = ButtonDefaults.buttonColors(
+                                        backgroundColor = if (isFindingPhone) Color(0xFF4C1D24) else CardSurface
+                                    )
                                 ) {
-                                    Text("📡 Buscar iOS", fontSize = 10.sp, color = Color(0xFFC4B5FD))
+                                    Text(
+                                        text = if (isFindingPhone) "🔇 Parar alarma" else "📡 Buscar iOS",
+                                        fontSize = 10.sp,
+                                        color = if (isFindingPhone) Color(0xFFFDA4AF) else Color(0xFFC4B5FD)
+                                    )
                                 }
                             }
                         }
 
-                        // 5. Reproductor Multimedia AMS + Volumen
+                        // 5. Reproductor Multimedia AMS + App + Volumen en vivo
                         item {
                             Column(
                                 modifier = Modifier
@@ -534,6 +544,22 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
                                     .padding(vertical = 10.dp, horizontal = 12.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally
                             ) {
+                                if (nowPlaying.playerName.isNotBlank() || nowPlaying.volumePercent != null) {
+                                    val playerBadge = buildString {
+                                        if (nowPlaying.playerName.isNotBlank()) append(nowPlaying.playerName)
+                                        nowPlaying.volumePercent?.let {
+                                            if (isNotEmpty()) append(" • ")
+                                            append("🔊 $it%")
+                                        }
+                                    }
+                                    Text(
+                                        text = playerBadge,
+                                        fontSize = 9.sp,
+                                        color = AccentCyan,
+                                        maxLines = 1
+                                    )
+                                    Spacer(modifier = Modifier.height(2.dp))
+                                }
                                 Text(
                                     text = nowPlaying.title,
                                     fontSize = 12.sp,
@@ -542,8 +568,13 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
+                                val subtitleLine = if (nowPlaying.album.isNotBlank()) {
+                                    "${nowPlaying.artist} • ${nowPlaying.album}"
+                                } else {
+                                    nowPlaying.artist
+                                }
                                 Text(
-                                    text = nowPlaying.artist,
+                                    text = subtitleLine,
                                     fontSize = 10.sp,
                                     color = TextSecondary,
                                     maxLines = 1,
@@ -754,7 +785,7 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
                                 } else if (telemetry?.weightKg == null) {
                                     Spacer(modifier = Modifier.height(4.dp))
                                     Text(
-                                        text = "Sincronizá desde la app Watch Bridge en tu iPhone",
+                                        text = "Sincronizá desde la app Watch Bridge en $phoneName",
                                         fontSize = 9.sp,
                                         color = TextSecondary,
                                         textAlign = TextAlign.Center
@@ -781,6 +812,51 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
                             .size(width = if (active) 14.dp else 5.dp, height = 5.dp)
                             .clip(CircleShape)
                             .background(if (active) AccentEmerald else Color(0xFF3F3F46))
+                    )
+                }
+            }
+        }
+
+        // Diálogo de alarma "Buscando tu reloj" disparada desde el iPhone
+        Dialog(
+            showDialog = isWatchRinging,
+            onDismissRequest = { service?.stopWatchFindAlarm(notifyPhone = true) }
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(BgObsidian)
+                    .padding(16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Text(
+                    text = "🔔 Buscando tu reloj",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = AccentCoral,
+                    textAlign = TextAlign.Center
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "Alerta enviada desde $phoneName",
+                    fontSize = 11.sp,
+                    color = TextSecondary,
+                    textAlign = TextAlign.Center
+                )
+                Spacer(modifier = Modifier.height(14.dp))
+                Button(
+                    onClick = { service?.stopWatchFindAlarm(notifyPhone = true) },
+                    modifier = Modifier
+                        .fillMaxWidth(0.88f)
+                        .height(42.dp),
+                    colors = ButtonDefaults.buttonColors(backgroundColor = AccentEmerald)
+                ) {
+                    Text(
+                        text = "Encontrado • Detener",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.Black
                     )
                 }
             }

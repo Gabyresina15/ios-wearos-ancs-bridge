@@ -1,5 +1,9 @@
 package com.ancsbridge.watch.ble
 
+import android.bluetooth.BluetoothAdapter
+import android.content.Context
+import android.os.Build
+import android.provider.Settings
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.charset.StandardCharsets
@@ -7,6 +11,8 @@ import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.roundToInt
 
 object AppleBleUuids {
     val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
@@ -42,6 +48,68 @@ object AppleBleUuids {
     val BRIDGE_WATCH_EVENT_CHAR: UUID = UUID.fromString("d973f2e3-b19e-11e2-9e96-0800200c9a66")
 }
 
+/**
+ * Resuelve dinámicamente el nombre real y modelo del reloj Wear OS desde el sistema Android y Bluetooth,
+ * sin ningún nombre hardcodeado.
+ */
+object WearDeviceIdentityResolver {
+    private val samsungWatchModels = mapOf(
+        "SM-R960" to "Galaxy Watch6 Classic",
+        "SM-R965" to "Galaxy Watch6 Classic",
+        "SM-R950" to "Galaxy Watch6 Classic",
+        "SM-R955" to "Galaxy Watch6 Classic",
+        "SM-R940" to "Galaxy Watch6",
+        "SM-R945" to "Galaxy Watch6",
+        "SM-R930" to "Galaxy Watch6",
+        "SM-R935" to "Galaxy Watch6",
+        "SM-L310" to "Galaxy Watch7",
+        "SM-L315" to "Galaxy Watch7",
+        "SM-L300" to "Galaxy Watch7",
+        "SM-L305" to "Galaxy Watch7",
+        "SM-L705" to "Galaxy Watch Ultra",
+        "SM-R920" to "Galaxy Watch5 Pro",
+        "SM-R925" to "Galaxy Watch5 Pro",
+        "SM-R910" to "Galaxy Watch5",
+        "SM-R900" to "Galaxy Watch5",
+        "SM-R890" to "Galaxy Watch4 Classic",
+        "SM-R880" to "Galaxy Watch4 Classic",
+        "SM-R870" to "Galaxy Watch4",
+        "SM-R860" to "Galaxy Watch4"
+    )
+
+    fun resolveWatchName(context: Context): String {
+        val globalName = runCatching {
+            Settings.Global.getString(context.contentResolver, Settings.Global.DEVICE_NAME)
+        }.getOrNull()?.trim()
+
+        val secureBtName = runCatching {
+            Settings.Secure.getString(context.contentResolver, "bluetooth_name")
+        }.getOrNull()?.trim()
+
+        val adapterName = runCatching {
+            @Suppress("MissingPermission")
+            BluetoothAdapter.getDefaultAdapter()?.name
+        }.getOrNull()?.trim()
+
+        val rawCandidate = listOfNotNull(globalName, secureBtName, adapterName)
+            .firstOrNull { it.isNotBlank() && !it.startsWith("SM-", ignoreCase = true) }
+
+        if (rawCandidate != null) {
+            return rawCandidate
+        }
+
+        val rawModel = Build.MODEL.orEmpty().trim()
+        val prefix = rawModel.take(7).uppercase()
+        samsungWatchModels[prefix]?.let { return it }
+
+        return if (rawModel.isNotBlank()) rawModel else "Reloj Wear OS"
+    }
+}
+
+/**
+ * Resuelve dinámicamente el nombre real del iPhone conectado combinando el servicio BLE GAP (0x2A00)
+ * y el código de modelo de hardware BLE DIS (0x2A24), sin valores hardcodeados.
+ */
 object AppleDeviceModelResolver {
     private val appleModels = mapOf(
         "iPhone17,2" to "iPhone 16 Pro Max",
@@ -59,7 +127,11 @@ object AppleDeviceModelResolver {
         "iPhone14,7" to "iPhone 14",
         "iPhone14,3" to "iPhone 13 Pro Max",
         "iPhone14,2" to "iPhone 13 Pro",
-        "iPhone14,5" to "iPhone 13"
+        "iPhone14,5" to "iPhone 13",
+        "iPhone14,4" to "iPhone 13 mini",
+        "iPhone13,4" to "iPhone 12 Pro Max",
+        "iPhone13,3" to "iPhone 12 Pro",
+        "iPhone13,2" to "iPhone 12"
     )
 
     fun resolveMarketingName(rawModelCode: String): String {
@@ -72,8 +144,7 @@ object AppleDeviceModelResolver {
         val cleanName = gapName?.trim()?.takeIf { it.isNotBlank() }
 
         return when {
-            resolvedModel != null && cleanName != null && !cleanName.equals("iPhone", ignoreCase = true) ->
-                cleanName
+            cleanName != null && !cleanName.equals("iPhone", ignoreCase = true) -> cleanName
             resolvedModel != null -> resolvedModel
             cleanName != null -> cleanName
             else -> "iPhone vinculado"
@@ -84,6 +155,9 @@ object AppleDeviceModelResolver {
 data class NowPlayingState(
     val title: String = "Sin reproducción",
     val artist: String = "Control multimedia",
+    val album: String = "",
+    val playerName: String = "",
+    val volumePercent: Int? = null,
     val isPlaying: Boolean = false
 )
 
@@ -140,8 +214,10 @@ object CtsTimeParser {
 }
 
 object AmsEntityParser {
-    val SUBSCRIBE_PLAYER_PLAYBACK_INFO = byteArrayOf(0x00, 0x01)
-    val SUBSCRIBE_TRACK_ARTIST_AND_TITLE = byteArrayOf(0x02, 0x00, 0x02)
+    // Entity 0 (Player): Attribute 0 = Name, Attribute 1 = PlaybackInfo, Attribute 2 = Volume
+    val SUBSCRIBE_PLAYER_PLAYBACK_INFO = byteArrayOf(0x00, 0x00, 0x01, 0x02)
+    // Entity 2 (Track): Attribute 0 = Artist, Attribute 1 = Album, Attribute 2 = Title
+    val SUBSCRIBE_TRACK_ARTIST_AND_TITLE = byteArrayOf(0x02, 0x00, 0x01, 0x02)
 
     fun applyEntityUpdate(current: NowPlayingState, bytes: ByteArray): NowPlayingState {
         if (bytes.size < 3) return current
@@ -151,14 +227,24 @@ object AmsEntityParser {
 
         return when (entityId) {
             0 -> {
-                if (attrId == 1) {
-                    val stateCode = textValue.substringBefore(',').toIntOrNull() ?: 0
-                    current.copy(isPlaying = (stateCode == 1))
-                } else current
+                when (attrId) {
+                    0 -> current.copy(playerName = textValue)
+                    1 -> {
+                        val stateCode = textValue.substringBefore(',').toIntOrNull() ?: 0
+                        current.copy(isPlaying = (stateCode == 1))
+                    }
+                    2 -> {
+                        val volFloat = textValue.toFloatOrNull()
+                        val pct = volFloat?.let { (it * 100f).roundToInt().coerceIn(0, 100) }
+                        current.copy(volumePercent = pct ?: current.volumePercent)
+                    }
+                    else -> current
+                }
             }
             2 -> {
                 when (attrId) {
                     0 -> current.copy(artist = textValue.ifEmpty { "Artista desconocido" })
+                    1 -> current.copy(album = textValue)
                     2 -> current.copy(title = textValue.ifEmpty { "Reproduciendo" })
                     else -> current
                 }
@@ -244,23 +330,63 @@ data class AncsNotification(
         get() = categoryId == 1 || appIdentifier == "com.apple.mobilephone"
 }
 
+/**
+ * Resuelve y cachea dinámicamente los nombres reales de las aplicaciones de iOS obtenidos
+ * mediante el comando nativo ANCS GetAppAttributes (0x01).
+ */
 object AppBundleResolver {
-    private val knownBundles = mapOf(
+    private const val PREFS_APP_NAMES = "ancs_dynamic_app_names"
+    private val memoryCache = ConcurrentHashMap<String, String>()
+
+    private val defaultBundles = mapOf(
         "net.whatsapp.WhatsApp" to "WhatsApp",
+        "net.whatsapp.WhatsAppSMB" to "WhatsApp Business",
         "com.burbn.instagram" to "Instagram",
         "com.atebits.Tweetie2" to "X",
         "com.google.Gmail" to "Gmail",
         "com.apple.MobileSMS" to "Mensajes",
         "com.apple.mobilephone" to "Teléfono",
         "com.apple.mobilecal" to "Calendario",
+        "com.apple.mobilemail" to "Mail",
+        "com.apple.facetime" to "FaceTime",
+        "com.apple.Passbook" to "Wallet",
+        "com.apple.Home" to "Casa",
         "ph.telegra.Telegraph" to "Telegram",
         "com.HammerAndChisel.Discord" to "Discord",
         "com.spotify.client" to "Spotify",
-        "com.mercadopago.MercadoPago" to "Mercado Pago"
+        "com.mercadopago.MercadoPago" to "Mercado Pago",
+        "com.mercadolibre" to "Mercado Libre",
+        "com.google.ios.youtube" to "YouTube",
+        "com.zhiliaoapp.musically" to "TikTok",
+        "com.ubercab.UberClient" to "Uber",
+        "com.pedidoya.app" to "PedidosYa"
     )
 
+    fun initialize(context: Context) {
+        val prefs = context.getSharedPreferences(PREFS_APP_NAMES, Context.MODE_PRIVATE)
+        for ((k, v) in prefs.all) {
+            if (v is String && v.isNotBlank()) {
+                memoryCache[k] = v
+            }
+        }
+    }
+
+    fun hasResolvedName(bundleId: String): Boolean {
+        return memoryCache.containsKey(bundleId) || defaultBundles.containsKey(bundleId)
+    }
+
+    fun cacheResolvedAppName(context: Context, bundleId: String, displayName: String) {
+        val clean = displayName.trim()
+        if (bundleId.isBlank() || clean.isBlank()) return
+        memoryCache[bundleId] = clean
+        context.getSharedPreferences(PREFS_APP_NAMES, Context.MODE_PRIVATE)
+            .edit().putString(bundleId, clean).apply()
+    }
+
     fun resolveName(bundleId: String): String {
-        return knownBundles[bundleId]
-            ?: bundleId.substringAfterLast('.').replaceFirstChar { it.uppercase() }
+        if (bundleId.isBlank()) return "App"
+        memoryCache[bundleId]?.let { return it }
+        defaultBundles[bundleId]?.let { return it }
+        return bundleId.substringAfterLast('.').replaceFirstChar { it.uppercase() }
     }
 }

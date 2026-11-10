@@ -13,6 +13,8 @@ import androidx.health.connect.client.records.StepsRecord
 import androidx.health.connect.client.records.WeightRecord
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
+import com.ancsbridge.watch.ble.NowPlayingState
+import com.ancsbridge.watch.ble.WearDeviceIdentityResolver
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -73,12 +75,20 @@ class TelemetrySyncManager(
         hardwareSensors.onHeartRateUpdated = listener
     }
 
+    fun setOnStepsUpdatedListener(listener: (Long) -> Unit) {
+        hardwareSensors.onStepsUpdated = listener
+    }
+
     fun triggerHeartRateMeasurement() {
         hardwareSensors.triggerHeartRateBurst()
     }
 
     fun release() {
         hardwareSensors.stopListening()
+    }
+
+    fun resolveWatchHardwareName(): String {
+        return WearDeviceIdentityResolver.resolveWatchName(context)
     }
 
     /**
@@ -205,14 +215,17 @@ class TelemetrySyncManager(
     }
 
     /**
-     * Serializa el snapshot en formato JSON compacto (<140 bytes) para transmisión BLE GATT.
+     * Serializa el snapshot en formato JSON compacto para transmisión BLE GATT, resolviendo
+     * dinámicamente el nombre real del reloj desde el sistema sin ningún string hardcodeado.
      */
     fun toBleJson(
         snapshot: WatchTelemetrySnapshot,
         isWatchMuted: Boolean,
         isHfpConnected: Boolean,
-        isHidConnected: Boolean
+        isHidConnected: Boolean,
+        nowPlaying: NowPlayingState? = null
     ): String {
+        val watchModelName = resolveWatchHardwareName()
         return JSONObject().apply {
             put("bat", snapshot.watchBatteryPercent)
             put("chg", snapshot.isCharging)
@@ -221,7 +234,13 @@ class TelemetrySyncManager(
             put("dnd", isWatchMuted)
             put("hfp", isHfpConnected)
             put("hid", isHidConnected)
-            put("model", "Galaxy Watch 6 Classic")
+            put("model", watchModelName)
+            if (nowPlaying != null) {
+                put("mTitle", nowPlaying.title.take(36))
+                put("mArtist", nowPlaying.artist.take(28))
+                put("mPlay", nowPlaying.isPlaying)
+                nowPlaying.volumePercent?.let { put("mVol", it) }
+            }
             put("ts", snapshot.timestamp)
         }.toString()
     }

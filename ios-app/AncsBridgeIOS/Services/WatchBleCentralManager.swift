@@ -4,21 +4,23 @@ import UIKit
 import EventKit
 
 /// Motor BLE Dual-Role (Central + Peripheral Server) para conexión instantánea y permanente
-/// entre el iPhone 16 Pro Max y el Samsung Galaxy Watch 6 Classic:
+/// entre iOS y el reloj Wear OS sin nombres ni identificadores hardcodeados:
 ///  • Rol 1 (CBPeripheralManager): Publica `BridgeSyncService` en la tabla GATT del propio iPhone.
-///    Como el Galaxy Watch YA está conectado al iPhone para leer ANCS/AMS, el reloj descubre este
-///    servicio sobre su conexión existente (`activeGatt`) en < 1 segundo sin depender de escaneos.
-///  • Rol 2 (CBCentralManager): Escanea y recupera el periférico del reloj cuando el reloj actúa como servidor.
+///    Como el reloj ya está conectado al iPhone para leer ANCS/AMS, descubre este servicio sobre
+///    su conexión existente (`activeGatt`) en < 1 segundo y además entrega su `CBPeer.identifier`
+///    exacto para que `CBCentralManager` se enlace en sentido inverso de forma determinística.
+///  • Rol 2 (CBCentralManager): Escanea, recupera por UUID y mantiene el enlace con el servidor GATT del reloj.
 @MainActor
 final class WatchBleCentralManager: NSObject, ObservableObject {
     static let shared = WatchBleCentralManager()
 
     // MARK: - Estado Publicado
     @Published private(set) var linkState: WatchLinkState = .searching
-    @Published private(set) var watchName: String = "Galaxy Watch 6 Classic"
+    @Published private(set) var watchName: String = "Reloj Wear OS"
     @Published private(set) var telemetry = WatchTelemetryPayload()
     @Published private(set) var lastTelemetryDate: Date?
     @Published private(set) var isSyncing = false
+    @Published private(set) var isRingingWatch = false
     @Published private(set) var recentNotifications: [WatchNotificationLogItem] = []
     @Published private(set) var blockedBundles: Set<String> = []
     @Published private(set) var discoveredApps: [IosAppFilterCatalogItem] = IosAppFilterCatalogItem.defaultCatalog
@@ -39,9 +41,11 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
     private var localEventChar: CBMutableCharacteristic?
     private var isLocalServicePublished = false
     private var hasSubscribedWatchCentral = false
+    private var pendingPeripheralUpdates: [Data] = []
 
     private var retryTask: Task<Void, Never>?
     private var nameScanTask: Task<Void, Never>?
+    private var ringWatchTimeoutTask: Task<Void, Never>?
     private var serviceRetryCount = 0
     private var lastContextSent: Date = .distantPast
 
@@ -52,13 +56,17 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
         static let blocked = "bridge_blocked_bundles"
         static let watchId = "bridge_saved_watch_uuid"
         static let watchName = "bridge_saved_watch_name"
+        static let resolvedApps = "bridge_resolved_app_names"
     }
 
     private override init() {
         super.init()
         UIDevice.current.isBatteryMonitoringEnabled = true
         blockedBundles = Set(defaults.stringArray(forKey: Keys.blocked) ?? ["com.apple.tips"])
-        if let saved = defaults.string(forKey: Keys.watchName), !saved.isEmpty { watchName = saved }
+        if let saved = defaults.string(forKey: Keys.watchName), !saved.isEmpty {
+            watchName = saved
+        }
+        loadSavedAppNames()
 
         central = CBCentralManager(
             delegate: self,
@@ -148,12 +156,23 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
 
         nameScanTask?.cancel()
         nameScanTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            try? await Task.sleep(nanoseconds: 3_500_000_000)
             guard let self, !Task.isCancelled, !self.linkState.isReady,
                   UIApplication.shared.applicationState == .active,
                   self.central.state == .poweredOn else { return }
             self.central.stopScan()
             self.central.scanForPeripherals(withServices: nil, options: nil)
+        }
+    }
+
+    private func bindCentralPeerIfNeeded(_ peerId: UUID) {
+        defaults.set(peerId.uuidString, forKey: Keys.watchId)
+        guard central.state == .poweredOn else { return }
+        if peripheral?.identifier == peerId && (peripheral?.state == .connected || peripheral?.state == .connecting) {
+            return
+        }
+        if let matched = central.retrievePeripherals(withIdentifiers: [peerId]).first {
+            connect(matched)
         }
     }
 
@@ -186,7 +205,7 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
 
     private func isLikelyWatch(_ p: CBPeripheral) -> Bool {
         let name = (p.name ?? "").lowercased()
-        return name.contains("watch") || name.contains("galaxy") || name.contains("samsung")
+        return name.contains("watch") || name.contains("galaxy") || name.contains("wear") || name.hasPrefix("sm-")
     }
 
     private func resetCharacteristics() {
@@ -205,10 +224,30 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
     }
 
     private func updateWatchName(_ raw: String) {
-        let clean = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty, !clean.hasPrefix("SM-") else { return }
-        watchName = clean
-        defaults.set(clean, forKey: Keys.watchName)
+        guard let normalized = DeviceHardwareResolver.normalizeWatchName(raw) else { return }
+        watchName = normalized
+        defaults.set(normalized, forKey: Keys.watchName)
+    }
+
+    private func loadSavedAppNames() {
+        guard let dict = defaults.dictionary(forKey: Keys.resolvedApps) as? [String: String] else { return }
+        for (bundleId, appName) in dict {
+            upsertDiscoveredApp(bundleId: bundleId, appName: appName)
+        }
+    }
+
+    private func upsertDiscoveredApp(bundleId: String, appName: String) {
+        guard !bundleId.isEmpty, !appName.isEmpty else { return }
+        if let idx = discoveredApps.firstIndex(where: { $0.bundleId == bundleId }) {
+            discoveredApps[idx].name = appName
+        } else {
+            discoveredApps.append(
+                IosAppFilterCatalogItem(name: appName, bundleId: bundleId, symbol: "app.badge.fill")
+            )
+        }
+        var saved = (defaults.dictionary(forKey: Keys.resolvedApps) as? [String: String]) ?? [:]
+        saved[bundleId] = appName
+        defaults.set(saved, forKey: Keys.resolvedApps)
     }
 
     // MARK: - Servidor GATT Local en iOS (CBPeripheralManager)
@@ -259,12 +298,15 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
         let level = UIDevice.current.batteryLevel
         let pct = level >= 0 ? Int((level * 100).rounded()) : 100
         let state = UIDevice.current.batteryState
+        let machineCode = DeviceHardwareResolver.currentMachineIdentifier()
+
         var payload: [String: Any] = [
             "cmd": "PHONE_CONTEXT",
             "bat": pct,
             "chg": state == .charging || state == .full,
             "platform": "iOS",
-            "phoneName": String(UIDevice.current.name.prefix(28))
+            "phoneName": String(UIDevice.current.name.prefix(28)),
+            "phoneModel": machineCode
         ]
         if let next = nextCalendarEventSummary() {
             payload["nextEvent"] = String(next.prefix(40))
@@ -289,17 +331,44 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
         Task {
             await HealthKitSyncManager.shared.refreshBodyComposition()
             sendBodyComposition(HealthKitSyncManager.shared.bodyComposition)
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
             isSyncing = false
         }
     }
 
+    func toggleFindWatch() {
+        if isRingingWatch {
+            stopFindingWatch()
+        } else {
+            findWatch()
+        }
+    }
+
     func findWatch() {
+        isRingingWatch = true
         sendJson([
             "cmd": "PING_WATCH",
-            "title": "Buscando tu reloj 🔔",
-            "msg": "Alerta enviada desde \(UIDevice.current.name)"
+            "active": true
         ])
+        ringWatchTimeoutTask?.cancel()
+        ringWatchTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 18_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.isRingingWatch = false
+        }
+    }
+
+    func stopFindingWatch() {
+        ringWatchTimeoutTask?.cancel()
+        isRingingWatch = false
+        sendJson([
+            "cmd": "PING_WATCH",
+            "active": false
+        ])
+    }
+
+    func notifyPhoneAlarmStopped() {
+        sendJson(["cmd": "FIND_PHONE_STOPPED"])
     }
 
     func measureWatchHeartRate() {
@@ -354,13 +423,32 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
             sent = true
         }
 
-        // Vía 2: Notificación desde el servidor GATT local de iOS hacia activeGatt del reloj
+        // Vía 2: Notificación desde el servidor GATT local de iOS hacia activeGatt del reloj (con cola anti-pérdida)
         if peripheralManager.state == .poweredOn, let localCmd = localCommandChar {
             let ok = peripheralManager.updateValue(data, for: localCmd, onSubscribedCentrals: nil)
-            if ok { sent = true }
+            if ok {
+                sent = true
+            } else {
+                if pendingPeripheralUpdates.count >= 16 {
+                    pendingPeripheralUpdates.removeFirst()
+                }
+                pendingPeripheralUpdates.append(data)
+                sent = true
+            }
         }
 
         return sent
+    }
+
+    private func flushPendingPeripheralUpdates() {
+        guard peripheralManager.state == .poweredOn, let localCmd = localCommandChar else { return }
+        while let next = pendingPeripheralUpdates.first {
+            if peripheralManager.updateValue(next, for: localCmd, onSubscribedCentrals: nil) {
+                pendingPeripheralUpdates.removeFirst()
+            } else {
+                break
+            }
+        }
     }
 
     private func nextCalendarEventSummary() -> String? {
@@ -397,7 +485,9 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
         telemetry = decoded
         lastTelemetryDate = Date()
         isSyncing = false
-        updateWatchName(decoded.model)
+        if !decoded.model.isEmpty {
+            updateWatchName(decoded.model)
+        }
         HealthKitSyncManager.shared.ingestWatchTelemetry(decoded)
 
         if Date().timeIntervalSince(lastContextSent) > 300 {
@@ -421,6 +511,19 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
                 PhoneFindMyAlarmManager.shared.stopAlarm()
             }
 
+        case "WATCH_FOUND":
+            ringWatchTimeoutTask?.cancel()
+            isRingingWatch = false
+
+        case "APP_NAME":
+            if let bundleId = json["app"] as? String,
+               let realName = json["appName"] as? String {
+                upsertDiscoveredApp(bundleId: bundleId, appName: realName)
+                for idx in recentNotifications.indices where recentNotifications[idx].app == bundleId {
+                    recentNotifications[idx].appName = realName
+                }
+            }
+
         case "NOTIF_LOG":
             guard let item = try? JSONDecoder().decode(WatchNotificationLogItem.self, from: data) else { return }
             recentNotifications.removeAll { $0.uid == item.uid }
@@ -428,11 +531,7 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
             if recentNotifications.count > 60 {
                 recentNotifications = Array(recentNotifications.prefix(60))
             }
-            if !item.app.isEmpty, !discoveredApps.contains(where: { $0.bundleId == item.app }) {
-                discoveredApps.append(
-                    IosAppFilterCatalogItem(name: item.appName, bundleId: item.app, symbol: "app.badge.fill")
-                )
-            }
+            upsertDiscoveredApp(bundleId: item.app, appName: item.appName)
 
         default:
             break
@@ -517,7 +616,7 @@ extension WatchBleCentralManager: CBCentralManagerDelegate {
             let advName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
             let matchesService = advServices.contains(BridgeBleUUIDs.bridgeService)
             let nameLower = (advName ?? peripheral.name ?? "").lowercased()
-            let matchesName = nameLower.contains("watch") || nameLower.contains("galaxy")
+            let matchesName = nameLower.contains("watch") || nameLower.contains("galaxy") || nameLower.contains("wear")
             guard matchesService || matchesName else { return }
 
             central.stopScan()
@@ -657,6 +756,12 @@ extension WatchBleCentralManager: CBPeripheralManagerDelegate {
         }
     }
 
+    nonisolated func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
+        MainActor.assumeIsolated {
+            flushPendingPeripheralUpdates()
+        }
+    }
+
     nonisolated func peripheralManager(
         _ peripheral: CBPeripheralManager,
         central: CBCentral,
@@ -664,6 +769,7 @@ extension WatchBleCentralManager: CBPeripheralManagerDelegate {
     ) {
         MainActor.assumeIsolated {
             hasSubscribedWatchCentral = true
+            bindCentralPeerIfNeeded(central.identifier)
             onLinkReady()
         }
     }
@@ -684,6 +790,7 @@ extension WatchBleCentralManager: CBPeripheralManagerDelegate {
     nonisolated func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
         MainActor.assumeIsolated {
             hasSubscribedWatchCentral = true
+            bindCentralPeerIfNeeded(request.central.identifier)
             if linkState != .ready { onLinkReady() }
 
             if request.characteristic.uuid == BridgeBleUUIDs.commandConfigChar,
@@ -702,6 +809,9 @@ extension WatchBleCentralManager: CBPeripheralManagerDelegate {
     nonisolated func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
         MainActor.assumeIsolated {
             hasSubscribedWatchCentral = true
+            if let firstCentral = requests.first?.central {
+                bindCentralPeerIfNeeded(firstCentral.identifier)
+            }
             if linkState != .ready { onLinkReady() }
 
             for req in requests {

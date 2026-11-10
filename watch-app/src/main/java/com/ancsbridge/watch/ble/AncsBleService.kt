@@ -14,6 +14,9 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
+import android.media.Ringtone
+import android.media.RingtoneManager
 import android.os.Binder
 import android.os.IBinder
 import android.os.ParcelUuid
@@ -59,8 +62,8 @@ class AncsBleService : LifecycleService() {
         private const val FG_NOTIFICATION_ID = 1001
         private const val PASSIVE_SCAN_REQUEST_CODE = 2002
         private const val MAX_GATT_QUEUE_SIZE = 64
-        private const val GATT_OP_TIMEOUT_MS = 5000L
-        private const val BLE_TELEMETRY_SYNC_INTERVAL_MS = 90_000L
+        private const val GATT_OP_TIMEOUT_MS = 4500L
+        private const val BLE_TELEMETRY_SYNC_INTERVAL_MS = 60_000L
 
         const val ACTION_FAST_RECONNECT = "com.ancsbridge.watch.ACTION_FAST_RECONNECT"
         const val ACTION_WATCHDOG_TICK = "com.ancsbridge.watch.ACTION_WATCHDOG_TICK"
@@ -95,8 +98,10 @@ class AncsBleService : LifecycleService() {
     private var gattServer: BluetoothGattServer? = null
     private var bridgeTelemetryChar: BluetoothGattCharacteristic? = null
     private var bridgeWatchEventChar: BluetoothGattCharacteristic? = null
+    private var hrMeasurementChar: BluetoothGattCharacteristic? = null
     private val subscribedCompanionDevices = ConcurrentHashMap.newKeySet<BluetoothDevice>()
     private val preparedWriteBuffers = ConcurrentHashMap<String, ByteArrayOutputStream>()
+    private val pendingAppNameQueries = ConcurrentHashMap.newKeySet<String>()
 
     // Características remotas cuando la app de iOS expone CBPeripheralManager sobre activeGatt
     private var remoteIosTelemetryChar: BluetoothGattCharacteristic? = null
@@ -119,6 +124,9 @@ class AncsBleService : LifecycleService() {
     private var connectionWatchdogJob: Job? = null
     private var gattOpTimeoutJob: Job? = null
     private var periodicSyncJob: Job? = null
+    private var watchAlarmTimeoutJob: Job? = null
+    private var mediaPushJob: Job? = null
+    private var activeWatchRingtone: Ringtone? = null
 
     private val silentFlagsByUid = ConcurrentHashMap<Int, Boolean>()
     private val categoryByUid = ConcurrentHashMap<Int, Int>()
@@ -157,6 +165,12 @@ class AncsBleService : LifecycleService() {
     private val _isWatchMuted = MutableStateFlow(false)
     val isWatchMuted: StateFlow<Boolean> = _isWatchMuted.asStateFlow()
 
+    private val _isFindingPhone = MutableStateFlow(false)
+    val isFindingPhone: StateFlow<Boolean> = _isFindingPhone.asStateFlow()
+
+    private val _isWatchRinging = MutableStateFlow(false)
+    val isWatchRinging: StateFlow<Boolean> = _isWatchRinging.asStateFlow()
+
     private val _syncedIphoneTime = MutableStateFlow<SyncedIphoneTime?>(null)
     val syncedIphoneTime: StateFlow<SyncedIphoneTime?> = _syncedIphoneTime.asStateFlow()
 
@@ -190,18 +204,37 @@ class AncsBleService : LifecycleService() {
     private val gattQueue = ConcurrentLinkedQueue<GattOperation>()
     @Volatile private var isGattBusy = false
 
-    private val dataSourceCollector = AncsDataSourceCollector { parsed ->
-        val wasSilent = silentFlagsByUid.remove(parsed.uid) ?: false
-        val catId = categoryByUid.remove(parsed.uid) ?: 0
-        val correctedTs = System.currentTimeMillis() + getSavedClockDrift()
-        handleParsedIosNotification(
-            parsed.copy(
-                categoryId = catId,
-                receivedInDndMode = wasSilent,
-                timestamp = correctedTs
+    private val dataSourceCollector = AncsDataSourceCollector(
+        expectedAttributesCount = 6,
+        onAppAttributeParsed = { bundleId, realAppName ->
+            pendingAppNameQueries.remove(bundleId)
+            AppBundleResolver.cacheResolvedAppName(this@AncsBleService, bundleId, realAppName)
+            _notifications.update { list ->
+                list.map { item ->
+                    if (item.appIdentifier == bundleId) item.copy(appDisplayName = realAppName) else item
+                }
+            }
+            notifyCompanionWatchEvent(
+                JSONObject().apply {
+                    put("evt", "APP_NAME")
+                    put("app", bundleId.take(48))
+                    put("appName", realAppName.take(28))
+                }
             )
-        )
-    }
+        },
+        onNotificationParsed = { parsed ->
+            val wasSilent = silentFlagsByUid.remove(parsed.uid) ?: false
+            val catId = categoryByUid.remove(parsed.uid) ?: 0
+            val correctedTs = System.currentTimeMillis() + getSavedClockDrift()
+            handleParsedIosNotification(
+                parsed.copy(
+                    categoryId = catId,
+                    receivedInDndMode = wasSilent,
+                    timestamp = correctedTs
+                )
+            )
+        }
+    )
 
     private val bondStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -231,6 +264,7 @@ class AncsBleService : LifecycleService() {
 
     override fun onCreate() {
         super.onCreate()
+        AppBundleResolver.initialize(this)
         bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
@@ -238,16 +272,18 @@ class AncsBleService : LifecycleService() {
         panController = BluetoothPanController(this, bluetoothManager.adapter).also { it.initialize() }
         hidController = HidShutterController(this, bluetoothManager.adapter, lifecycleScope).also { it.initialize() }
         telemetryManager = TelemetrySyncManager(this, lifecycleScope).also { manager ->
-            manager.setOnHeartRateUpdatedListener {
-                syncTelemetryNow()
-            }
+            manager.setOnHeartRateUpdatedListener { syncTelemetryNow() }
+            manager.setOnStepsUpdatedListener { syncTelemetryNow() }
         }
 
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         _allowDndNotifications.value = prefs.getBoolean(KEY_ALLOW_DND_NOTIFS, true)
         _isWatchMuted.value = prefs.getBoolean(KEY_WATCH_MUTED, false)
         _blockedBundles.value = prefs.getStringSet(KEY_BLOCKED_BUNDLES, setOf("com.apple.tips")) ?: emptySet()
-        prefs.getString(KEY_LAST_IPHONE_NAME, null)?.let { _connectedDeviceName.value = it }
+        prefs.getString(KEY_LAST_IPHONE_NAME, null)?.let { savedName ->
+            rawGapDeviceName = savedName
+            _connectedDeviceName.value = savedName
+        }
         val cachedPhoneBat = prefs.getInt(KEY_LAST_IPHONE_BATTERY, -1)
         if (cachedPhoneBat in 0..100) _iphoneBatteryPercent.value = cachedPhoneBat
 
@@ -300,6 +336,8 @@ class AncsBleService : LifecycleService() {
                 val device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
                 if (device != null && _connectionState.value != BleConnectionState.READY) {
                     connectToIphoneGatt(device, autoConnect = false)
+                } else if (activeGatt != null && !_phoneContext.value.companionConnected) {
+                    runCatching { activeGatt?.discoverServices() }
                 }
             }
             ACTION_WATCHDOG_TICK -> {
@@ -307,7 +345,7 @@ class AncsBleService : LifecycleService() {
                 if (_connectionState.value == BleConnectionState.READY && activeGatt != null) {
                     requestIphoneBatteryLevel()
                     requestIphoneTimeSync()
-                    if (!_phoneContext.value.companionConnected) {
+                    if (!_phoneContext.value.companionConnected && remoteIosCommandChar == null) {
                         runCatching { activeGatt?.discoverServices() }
                     }
                 } else if (_autoReconnect.value) {
@@ -333,6 +371,7 @@ class AncsBleService : LifecycleService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        stopWatchFindAlarm(notifyPhone = false)
         stopCallVibrationIfNeeded()
         runCatching { unregisterReceiver(bondStateReceiver) }
         stopBleBridge()
@@ -360,8 +399,7 @@ class AncsBleService : LifecycleService() {
 
     /**
      * Pausa o reactiva por completo las notificaciones en el reloj.
-     * Cuando está en true (Silenciado/Pausado), no vibran NI aparecen notificaciones del sistema en el reloj
-     * (evitando cualquier punto naranja o distracción hasta que el usuario lo vuelva a activar).
+     * Cuando está en true (Silenciado/Pausado), no vibran NI aparecen notificaciones del sistema en el reloj.
      */
     fun setWatchMuted(muted: Boolean) {
         _isWatchMuted.value = muted
@@ -564,7 +602,7 @@ class AncsBleService : LifecycleService() {
             stopActiveLowPowerScan()
             if (_connectionState.value != BleConnectionState.READY && !isConnectingOrConnected) {
                 connectToIphoneGatt(device, autoConnect = false)
-            } else if (activeGatt != null && !_phoneContext.value.companionConnected) {
+            } else if (activeGatt != null && !_phoneContext.value.companionConnected && remoteIosCommandChar == null) {
                 runCatching { activeGatt?.discoverServices() }
             }
         }
@@ -607,22 +645,30 @@ class AncsBleService : LifecycleService() {
 
     /**
      * Configura el servidor GATT local del reloj registrando secuencialmente BRIDGE_SYNC_SERVICE
-     * y luego GENERIC_HEART_RATE_SERVICE dentro de onServiceAdded para garantizar que Android
-     * exponga siempre todas las características a CoreBluetooth de iOS.
+     * y luego GENERIC_HEART_RATE_SERVICE dentro de onServiceAdded.
      */
     private fun setupBridgeGattServer() {
         if (gattServer != null) return
+
+        val hrChar = BluetoothGattCharacteristic(
+            AppleBleUuids.HEART_RATE_MEASUREMENT_CHAR,
+            BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+            BluetoothGattCharacteristic.PERMISSION_READ
+        ).apply {
+            addDescriptor(
+                BluetoothGattDescriptor(
+                    AppleBleUuids.CCCD,
+                    BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
+                )
+            )
+        }
+        hrMeasurementChar = hrChar
+
         val hrService = BluetoothGattService(
             AppleBleUuids.GENERIC_HEART_RATE_SERVICE,
             BluetoothGattService.SERVICE_TYPE_PRIMARY
         ).apply {
-            addCharacteristic(
-                BluetoothGattCharacteristic(
-                    AppleBleUuids.HEART_RATE_MEASUREMENT_CHAR,
-                    BluetoothGattCharacteristic.PROPERTY_READ or BluetoothGattCharacteristic.PROPERTY_NOTIFY,
-                    BluetoothGattCharacteristic.PERMISSION_READ
-                )
-            )
+            addCharacteristic(hrChar)
         }
 
         val bridgeService = BluetoothGattService(
@@ -684,6 +730,8 @@ class AncsBleService : LifecycleService() {
                     hidController.bindToPhone(device)
                     if (!isConnectingOrConnected && activeGatt == null) {
                         connectToIphoneGatt(device, autoConnect = false)
+                    } else if (activeGatt != null && remoteIosCommandChar == null) {
+                        runCatching { activeGatt?.discoverServices() }
                     }
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     subscribedCompanionDevices.remove(device)
@@ -704,6 +752,12 @@ class AncsBleService : LifecycleService() {
                     AppleBleUuids.BRIDGE_TELEMETRY_CHAR -> {
                         val payload = buildCurrentTelemetryBleBytes()
                         val slice = if (offset < payload.size) payload.copyOfRange(offset, payload.size) else ByteArray(0)
+                        gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, slice)
+                    }
+                    AppleBleUuids.HEART_RATE_MEASUREMENT_CHAR -> {
+                        val bpm = (_latestTelemetry.value?.latestHeartRateBpm ?: 0L).coerceIn(0L, 255L).toByte()
+                        val hrBytes = byteArrayOf(0x00, bpm)
+                        val slice = if (offset < hrBytes.size) hrBytes.copyOfRange(offset, hrBytes.size) else ByteArray(0)
                         gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, slice)
                     }
                     else -> {
@@ -782,20 +836,16 @@ class AncsBleService : LifecycleService() {
             val json = JSONObject(rawJson)
             when (json.optString("cmd")) {
                 "PING_WATCH" -> {
-                    val title = json.optString("title", "Buscando tu reloj 🔔")
-                    val msg = json.optString("msg", "Alerta enviada desde tu iPhone")
-                    vibrateAlertPattern(forceIgnoreMute = true)
-                    postLocalWearNotification(
-                        AncsNotification(
-                            uid = (System.currentTimeMillis() % Int.MAX_VALUE).toInt(),
-                            appIdentifier = "com.ancsbridge.ios",
-                            appDisplayName = _connectedDeviceName.value,
-                            title = title,
-                            subtitle = "",
-                            message = msg
-                        ),
-                        forceVibrate = true
-                    )
+                    val active = json.optBoolean("active", true)
+                    if (active) {
+                        startWatchFindAlarm()
+                    } else {
+                        stopWatchFindAlarm(notifyPhone = false)
+                    }
+                }
+
+                "FIND_PHONE_STOPPED" -> {
+                    _isFindingPhone.value = false
                 }
 
                 "SYNC_NOW" -> syncTelemetryNow()
@@ -843,11 +893,13 @@ class AncsBleService : LifecycleService() {
                     val nextEvent = json.optString("nextEvent", "").takeIf { it.isNotBlank() }
                     val platform = json.optString("platform", "iOS")
                     val phoneName = json.optString("phoneName", "").takeIf { it.isNotBlank() }
+                    val phoneModel = json.optString("phoneModel", "").takeIf { it.isNotBlank() }
 
-                    if (phoneName != null) updateDetectedPhoneName(phoneName, null)
+                    if (phoneName != null || phoneModel != null) {
+                        updateDetectedPhoneName(phoneName, phoneModel)
+                    }
                     if (phoneBat != null) updatePhoneBattery(phoneBat)
 
-                    // Si el paquete PHONE_CONTEXT también trae datos de Femmto embebidos, los guardamos
                     if (json.has("wt") || json.has("fat")) {
                         val wt = if (json.has("wt") && !json.isNull("wt")) json.optDouble("wt") else null
                         val fat = if (json.has("fat") && !json.isNull("fat")) json.optDouble("fat") else null
@@ -892,6 +944,59 @@ class AncsBleService : LifecycleService() {
     }
 
     /**
+     * Inicia una alarma audible y vibratoria real en el parlante del reloj cuando el usuario
+     * toca "Buscar reloj" en su iPhone.
+     */
+    private fun startWatchFindAlarm() {
+        _isWatchRinging.value = true
+        val vibrator = (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
+        vibrator.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 450, 200, 450, 250), 0))
+
+        runCatching {
+            activeWatchRingtone?.stop()
+            val uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
+                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+            val ringtone = RingtoneManager.getRingtone(this, uri)
+            ringtone?.audioAttributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ALARM)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+            ringtone?.play()
+            activeWatchRingtone = ringtone
+        }
+
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        }
+        runCatching { startActivity(openIntent) }
+
+        watchAlarmTimeoutJob?.cancel()
+        watchAlarmTimeoutJob = lifecycleScope.launch {
+            delay(18_000L)
+            if (_isWatchRinging.value) {
+                stopWatchFindAlarm(notifyPhone = true)
+            }
+        }
+    }
+
+    fun stopWatchFindAlarm(notifyPhone: Boolean = true) {
+        watchAlarmTimeoutJob?.cancel()
+        _isWatchRinging.value = false
+        runCatching {
+            activeWatchRingtone?.stop()
+            activeWatchRingtone = null
+        }
+        runCatching {
+            val vibrator = (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
+            vibrator.cancel()
+        }
+        if (notifyPhone) {
+            notifyCompanionWatchEvent(JSONObject().put("evt", "WATCH_FOUND"))
+        }
+    }
+
+    /**
      * Envía un evento del reloj hacia la app de iOS tanto por servidor GATT local (Notify)
      * como por escritura directa GATT Client si la app de iOS expone CBPeripheralManager en activeGatt.
      */
@@ -924,15 +1029,24 @@ class AncsBleService : LifecycleService() {
             snapshot = snapshot,
             isWatchMuted = _isWatchMuted.value,
             isHfpConnected = hfpController.isHfpConnected.value,
-            isHidConnected = hidController.isHidConnected.value
+            isHidConnected = hidController.isHidConnected.value,
+            nowPlaying = _nowPlaying.value
         ).toByteArray(StandardCharsets.UTF_8)
 
         val server = gattServer
         val char = bridgeTelemetryChar
-        if (server != null && char != null) {
+        val hrChar = hrMeasurementChar
+        val hrBytes = if (snapshot.latestHeartRateBpm > 0L) {
+            byteArrayOf(0x00, snapshot.latestHeartRateBpm.coerceIn(30L, 240L).toByte())
+        } else null
+
+        if (server != null) {
             for (device in subscribedCompanionDevices) {
-                runCatching {
-                    server.notifyCharacteristicChanged(device, char, false, bytes)
+                if (char != null) {
+                    runCatching { server.notifyCharacteristicChanged(device, char, false, bytes) }
+                }
+                if (hrChar != null && hrBytes != null) {
+                    runCatching { server.notifyCharacteristicChanged(device, hrChar, false, hrBytes) }
                 }
             }
         }
@@ -961,33 +1075,35 @@ class AncsBleService : LifecycleService() {
             snapshot = snap,
             isWatchMuted = _isWatchMuted.value,
             isHfpConnected = hfpController.isHfpConnected.value,
-            isHidConnected = hidController.isHidConnected.value
+            isHidConnected = hidController.isHidConnected.value,
+            nowPlaying = _nowPlaying.value
         ).toByteArray(StandardCharsets.UTF_8)
     }
 
     /**
-     * Publicidad BLE estrictamente menor a 31 bytes tanto en advertiseData como en scanResponse
-     * para evitar ADVERTISE_FAILED_DATA_TOO_LARGE en Wear OS y garantizar descubrimiento inmediato en iOS.
+     * Publicidad BLE estrictamente menor a 31 bytes tanto en advertiseData como en scanResponse.
      */
     private fun startBalancedSolicitedAdvertising(adapter: BluetoothAdapter) {
         if (isAdvertising) return
         advertiser = adapter.bluetoothLeAdvertiser ?: return
 
+        val isFullyLinked = _connectionState.value == BleConnectionState.READY && _phoneContext.value.companionConnected
         val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+            .setAdvertiseMode(
+                if (isFullyLinked) AdvertiseSettings.ADVERTISE_MODE_BALANCED
+                else AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY
+            )
             .setConnectable(true)
             .setTimeout(0)
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
             .build()
 
-        // Paquete principal: 18 bytes (UUID de 128 bits de nuestro BridgeSyncService) <= 31 bytes
         val advertiseData = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
             .setIncludeTxPowerLevel(false)
             .addServiceUuid(ParcelUuid(AppleBleUuids.BRIDGE_SYNC_SERVICE))
             .build()
 
-        // Scan Response: Solicitud de ANCS + UUID de Heart Rate (16 bits) <= 31 bytes
         val scanResponse = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
             .addServiceSolicitationUuid(ParcelUuid(AppleBleUuids.ANCS_SERVICE))
@@ -1086,7 +1202,8 @@ class AncsBleService : LifecycleService() {
                     isGattBusy = false
                     dataSourceCollector.reset()
 
-                    gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
+                    // Prioridad alta durante el descubrimiento inicial para enlace instantáneo (< 400ms)
+                    gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
                     gatt.requestMtu(247)
 
                     hfpController.bindToIphone(gatt.device)
@@ -1110,8 +1227,6 @@ class AncsBleService : LifecycleService() {
         }
 
         override fun onServiceChanged(gatt: BluetoothGatt) {
-            // Cuando el usuario abre la app Watch Bridge en el iPhone y CBPeripheralManager publica BridgeSyncService,
-            // iOS emite un evento Service Changed por BLE: redescubrimos servicios inmediatamente.
             runCatching { gatt.discoverServices() }
         }
 
@@ -1204,6 +1319,9 @@ class AncsBleService : LifecycleService() {
                 delay(1200)
                 panController.evaluateAndArbitrateNetwork()
                 syncTelemetryNow()
+                delay(2500)
+                // Pasamos a prioridad balanceada tras la ráfaga inicial para optimizar batería 24/7
+                runCatching { gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED) }
             }
         }
 
@@ -1251,6 +1369,7 @@ class AncsBleService : LifecycleService() {
                 AppleBleUuids.BAS_BATTERY_LEVEL_CHAR -> handleIphoneBatteryPayload(value)
                 AppleBleUuids.AMS_ENTITY_UPDATE -> {
                     _nowPlaying.update { current -> AmsEntityParser.applyEntityUpdate(current, value) }
+                    scheduleThrottledMediaSync()
                 }
                 AppleBleUuids.BRIDGE_COMMAND_CONFIG_CHAR -> {
                     if (value.isNotEmpty()) {
@@ -1261,9 +1380,29 @@ class AncsBleService : LifecycleService() {
         }
     }
 
+    private fun scheduleThrottledMediaSync() {
+        if (mediaPushJob?.isActive == true) return
+        mediaPushJob = lifecycleScope.launch(Dispatchers.IO) {
+            delay(650L)
+            syncTelemetryNow()
+        }
+    }
+
+    /**
+     * Actualiza el nombre del iPhone sin sobrescribir jamás un nombre real de GAP (ej. "iPhone de ...")
+     * con el string genérico "iPhone" que devuelve UIDevice.current.name en iOS 16+.
+     */
     private fun updateDetectedPhoneName(newGapName: String?, newModelCode: String?) {
-        if (!newGapName.isNullOrBlank()) rawGapDeviceName = newGapName
-        if (!newModelCode.isNullOrBlank()) rawDisModelCode = newModelCode
+        val cleanCandidate = newGapName?.trim()
+        if (!cleanCandidate.isNullOrBlank()) {
+            val isGenericIphone = cleanCandidate.equals("iPhone", ignoreCase = true)
+            if (!isGenericIphone || rawGapDeviceName.isNullOrBlank()) {
+                rawGapDeviceName = cleanCandidate
+            }
+        }
+        if (!newModelCode.isNullOrBlank()) {
+            rawDisModelCode = newModelCode.trim()
+        }
 
         val resolved = AppleDeviceModelResolver.formatDisplayIdentity(
             gapName = rawGapDeviceName ?: connectedIphone?.name,
@@ -1317,7 +1456,16 @@ class AncsBleService : LifecycleService() {
         }
     }
 
+    fun toggleFindMyIphone() {
+        if (_isFindingPhone.value) {
+            stopFindMyIphone()
+        } else {
+            ringMyIphone()
+        }
+    }
+
     fun ringMyIphone() {
+        _isFindingPhone.value = true
         val vibrator = (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
         vibrator.vibrate(VibrationEffect.createOneShot(140, VibrationEffect.DEFAULT_AMPLITUDE))
 
@@ -1329,12 +1477,26 @@ class AncsBleService : LifecycleService() {
         )
 
         lifecycleScope.launch {
-            sendAmsMediaCommand(AmsRemoteCommandId.PLAY)
-            repeat(4) {
-                delay(200)
-                sendAmsMediaCommand(AmsRemoteCommandId.VOLUME_UP)
+            if (!_phoneContext.value.companionConnected) {
+                sendAmsMediaCommand(AmsRemoteCommandId.PLAY)
+                repeat(4) {
+                    delay(200)
+                    sendAmsMediaCommand(AmsRemoteCommandId.VOLUME_UP)
+                }
             }
+            delay(16_000L)
+            _isFindingPhone.value = false
         }
+    }
+
+    fun stopFindMyIphone() {
+        _isFindingPhone.value = false
+        notifyCompanionWatchEvent(
+            JSONObject().apply {
+                put("evt", "FIND_PHONE")
+                put("active", false)
+            }
+        )
     }
 
     private fun enableCharacteristicNotifications(gatt: BluetoothGatt, char: BluetoothGattCharacteristic) {
@@ -1348,7 +1510,6 @@ class AncsBleService : LifecycleService() {
         when (header.eventId) {
             AncsEventId.ADDED, AncsEventId.MODIFIED -> {
                 if (header.isPreExisting && !header.isIncomingCall) return
-                // Si el usuario silenció/pausó las notificaciones en el reloj, no pedimos ni mostramos alertas normales
                 if (_isWatchMuted.value && !header.isIncomingCall) return
                 if (header.isSilent && !_allowDndNotifications.value && !header.isIncomingCall) return
 
@@ -1385,12 +1546,26 @@ class AncsBleService : LifecycleService() {
         if (_blockedBundles.value.contains(notification.appIdentifier) && !notification.isIncomingCall) return
         if (_isWatchMuted.value && !notification.isIncomingCall) return
 
+        // Si no conocemos aún el nombre real oficial de esta app en iOS, lo consultamos con GetAppAttributes (0x01)
+        val bundleId = notification.appIdentifier
+        if (bundleId.isNotBlank() && !AppBundleResolver.hasResolvedName(bundleId) && pendingAppNameQueries.add(bundleId)) {
+            activeGatt?.getService(AppleBleUuids.ANCS_SERVICE)
+                ?.getCharacteristic(AppleBleUuids.ANCS_CONTROL_POINT)
+                ?.let { controlPoint ->
+                    val appAttrCmd = AncsProtocol.buildGetAppAttributesCommand(bundleId)
+                    enqueueGattOperation(
+                        GattOperation.WriteCharacteristic(
+                            controlPoint, appAttrCmd, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                        )
+                    )
+                }
+        }
+
         _notifications.update { current ->
             (listOf(notification) + current.filterNot { it.uid == notification.uid }).take(40)
         }
         postLocalWearNotification(notification, forceVibrate = notification.isIncomingCall)
 
-        // Enviamos versión compacta (< 160 bytes) para que entre en un paquete BLE sin truncarse
         notifyCompanionWatchEvent(
             JSONObject().apply {
                 put("evt", "NOTIF_LOG")
@@ -1524,12 +1699,6 @@ class AncsBleService : LifecycleService() {
         if (!dispatched) completeCurrentGattOperation()
     }
 
-    private fun vibrateAlertPattern(forceIgnoreMute: Boolean = false) {
-        if (_isWatchMuted.value && !forceIgnoreMute) return
-        val vibrator = (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
-        vibrator.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 300, 150, 300, 150, 400), -1))
-    }
-
     private fun stopCallVibrationIfNeeded() {
         activeCallUid = null
         runCatching {
@@ -1554,8 +1723,6 @@ class AncsBleService : LifecycleService() {
 
     private fun postLocalWearNotification(item: AncsNotification, forceVibrate: Boolean = false) {
         val isIncomingCall = item.isIncomingCall
-        // Si las notificaciones están silenciadas/pausadas en el reloj, NO publicamos nada en el sistema
-        // para que no se encienda el punto naranja ni salte ningún cartel.
         if (_isWatchMuted.value && !forceVibrate && !isIncomingCall) {
             return
         }
@@ -1652,8 +1819,6 @@ class AncsBleService : LifecycleService() {
         _connectionState.value = newState
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit().putString(KEY_LAST_CONN_LABEL, newState.label).apply()
-        // NO llamamos a notificationManager.notify(FG_NOTIFICATION_ID, ...) aquí
-        // para que One UI Watch no vuelva a encender el punto naranja de notificaciones.
         BridgeStatusTileService.requestUpdate(this)
     }
 
@@ -1672,7 +1837,6 @@ class AncsBleService : LifecycleService() {
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getLong(KEY_CLOCK_DRIFT_MS, 0L)
 
     private fun createNotificationChannels() {
-        // Eliminamos el canal viejo de importancia baja que causaba el punto naranja fijo en el reloj
         runCatching { notificationManager.deleteNotificationChannel(LEGACY_FG_CHANNEL_ID) }
         runCatching { notificationManager.deleteNotificationChannel("ancs_bg_link_silent_v2") }
 

@@ -1,5 +1,6 @@
 package com.ancsbridge.watch.ble
 
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanResult
@@ -64,7 +65,6 @@ class BlePassiveScanReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.action) {
             ACTION_PASSIVE_BLE_FOUND -> {
-                // Soporta tanto el resultado de BluetoothLeScanner (EXTRA_LIST_SCAN_RESULT) como EXTRA_DEVICE directo
                 val scanResults = intent.getParcelableArrayListExtra(
                     BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT,
                     ScanResult::class.java
@@ -76,6 +76,25 @@ class BlePassiveScanReceiver : BroadcastReceiver() {
                     val serviceIntent = Intent(context, AncsBleService::class.java).apply {
                         action = AncsBleService.ACTION_FAST_RECONNECT
                         putExtra(BluetoothDevice.EXTRA_DEVICE, foundDevice)
+                    }
+                    runCatching { context.startForegroundService(serviceIntent) }
+                }
+            }
+
+            BluetoothDevice.ACTION_ACL_CONNECTED -> {
+                val device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                val serviceIntent = Intent(context, AncsBleService::class.java).apply {
+                    action = if (device != null) AncsBleService.ACTION_FAST_RECONNECT else AncsBleService.ACTION_WATCHDOG_TICK
+                    if (device != null) putExtra(BluetoothDevice.EXTRA_DEVICE, device)
+                }
+                runCatching { context.startForegroundService(serviceIntent) }
+            }
+
+            BluetoothAdapter.ACTION_STATE_CHANGED -> {
+                val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+                if (state == BluetoothAdapter.STATE_ON) {
+                    val serviceIntent = Intent(context, AncsBleService::class.java).apply {
+                        action = AncsBleService.ACTION_WATCHDOG_TICK
                     }
                     runCatching { context.startForegroundService(serviceIntent) }
                 }
@@ -94,7 +113,8 @@ class BlePassiveScanReceiver : BroadcastReceiver() {
                 runCatching { context.startForegroundService(serviceIntent) }
             }
 
-            Intent.ACTION_BOOT_COMPLETED -> {
+            Intent.ACTION_BOOT_COMPLETED,
+            Intent.ACTION_MY_PACKAGE_REPLACED -> {
                 val serviceIntent = Intent(context, AncsBleService::class.java)
                 runCatching { context.startForegroundService(serviceIntent) }
             }

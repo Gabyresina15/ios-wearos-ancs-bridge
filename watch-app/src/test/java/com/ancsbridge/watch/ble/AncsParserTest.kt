@@ -227,13 +227,27 @@ class AncsParserTest {
     }
 
     @Test
-    fun amsEntityParser_detectsTruncationFlag() {
+    fun amsEntityParser_detectsTruncationFlagAndAppliesFullEntityAttribute() {
         val state = AmsEntityParser.applyEntityUpdate(
             NowPlayingState(),
             amsUpdate(entity = 2, attr = 2, "Titulo cortado", flags = 0x01)
         )
         assertEquals("Titulo cortado", state.title)
         assertTrue(state.isTruncated)
+
+        val cmd = AmsEntityParser.buildEntityAttributeCommand(2, 2)
+        assertEquals(2, cmd.size)
+        assertEquals(2, cmd[0].toInt())
+        assertEquals(2, cmd[1].toInt())
+
+        val fullState = AmsEntityParser.applyFullEntityAttribute(
+            state,
+            entityId = 2,
+            attrId = 2,
+            rawValue = "Título completo sin truncamiento desde EntityAttribute".toByteArray(StandardCharsets.UTF_8)
+        )
+        assertEquals("Título completo sin truncamiento desde EntityAttribute", fullState.title)
+        assertFalse(fullState.isTruncated)
     }
 
     @Test

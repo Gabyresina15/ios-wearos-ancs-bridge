@@ -40,6 +40,7 @@ object AppleBleUuids {
     val AMS_SERVICE: UUID = UUID.fromString("89d3502b-0f36-433a-8ef4-c502ad55f8dc")
     val AMS_REMOTE_COMMAND: UUID = UUID.fromString("9b3c81d8-57b1-4a8a-b8df-0e56f7ca51c2")
     val AMS_ENTITY_UPDATE: UUID = UUID.fromString("2f7cabce-808d-411f-9a0c-bb92ba96c102")
+    val AMS_ENTITY_ATTRIBUTE: UUID = UUID.fromString("c6b2f38c-23ab-46d8-a6ab-a3a870b55d74")
 
     // Canal BLE GATT nativo directo (Reloj <-> App Nativa iOS sin servidor cloud)
     val BRIDGE_SYNC_SERVICE: UUID = UUID.fromString("d973f2e0-b19e-11e2-9e96-0800200c9a66")
@@ -227,33 +228,53 @@ object AmsEntityParser {
         val truncated = (flags and 0x01) != 0
         val textValue = String(bytes, 3, bytes.size - 3, StandardCharsets.UTF_8).trim()
 
-        val updated = when (entityId) {
-            0 -> {
-                when (attrId) {
-                    0 -> current.copy(playerName = textValue)
-                    1 -> {
-                        val stateCode = textValue.substringBefore(',').toIntOrNull() ?: 0
-                        current.copy(isPlaying = (stateCode == 1))
-                    }
-                    2 -> {
-                        val volFloat = textValue.toFloatOrNull()
-                        val pct = volFloat?.let { (it * 100f).roundToInt().coerceIn(0, 100) }
-                        current.copy(volumePercent = pct ?: current.volumePercent)
-                    }
-                    else -> current
-                }
-            }
-            2 -> {
-                when (attrId) {
-                    0 -> current.copy(artist = textValue.ifEmpty { "Artista desconocido" })
-                    1 -> current.copy(album = textValue)
-                    2 -> current.copy(title = textValue.ifEmpty { "Reproduciendo" })
-                    else -> current
-                }
-            }
-            else -> current
-        }
+        val updated = applyAttributeText(current, entityId, attrId, textValue)
         return updated.copy(isTruncated = truncated)
+    }
+
+    fun buildEntityAttributeCommand(entityId: Byte, attrId: Byte): ByteArray =
+        byteArrayOf(entityId, attrId)
+
+    fun applyFullEntityAttribute(
+        current: NowPlayingState,
+        entityId: Int,
+        attrId: Int,
+        rawValue: ByteArray
+    ): NowPlayingState {
+        val textValue = String(rawValue, StandardCharsets.UTF_8).trim()
+        return applyAttributeText(current, entityId, attrId, textValue).copy(isTruncated = false)
+    }
+
+    private fun applyAttributeText(
+        current: NowPlayingState,
+        entityId: Int,
+        attrId: Int,
+        textValue: String
+    ): NowPlayingState = when (entityId) {
+        0 -> {
+            when (attrId) {
+                0 -> current.copy(playerName = textValue)
+                1 -> {
+                    val stateCode = textValue.substringBefore(',').toIntOrNull() ?: 0
+                    current.copy(isPlaying = (stateCode == 1))
+                }
+                2 -> {
+                    val volFloat = textValue.toFloatOrNull()
+                    val pct = volFloat?.let { (it * 100f).roundToInt().coerceIn(0, 100) }
+                    current.copy(volumePercent = pct ?: current.volumePercent)
+                }
+                else -> current
+            }
+        }
+        2 -> {
+            when (attrId) {
+                0 -> current.copy(artist = textValue.ifEmpty { "Artista desconocido" })
+                1 -> current.copy(album = textValue)
+                2 -> current.copy(title = textValue.ifEmpty { "Reproduciendo" })
+                else -> current
+            }
+        }
+        else -> current
     }
 }
 

@@ -210,6 +210,8 @@ class AncsBleService : LifecycleService() {
 
     private val gattQueue = ConcurrentLinkedQueue<GattOperation>()
     @Volatile private var inFlightOpId: Long = 0L
+    @Volatile private var pendingAmsTruncatedTarget: Pair<Int, Int>? = null
+    @Volatile private var isPassiveScanArmed: Boolean = false
 
     private val dataSourceCollector = AncsDataSourceCollector(
         expectedAttributesCount = 6,
@@ -489,6 +491,7 @@ class AncsBleService : LifecycleService() {
         gattOpTimeoutJob?.cancel()
         periodicSyncJob?.cancel()
         stopActiveLowPowerScan()
+        stopPassiveHardwareScan()
         stopSafeAdvertising()
         runCatching {
             activeGatt?.disconnect()
@@ -536,12 +539,14 @@ class AncsBleService : LifecycleService() {
 
     private fun resetGattAndReschedule(gatt: BluetoothGatt?, forceCacheRefresh: Boolean) {
         lifecycleScope.launch(Dispatchers.Main.immediate) {
+            connectJob?.cancel()
             connectionWatchdogJob?.cancel()
             mtuFallbackJob?.cancel()
             gattOpTimeoutJob?.cancel()
             periodicSyncJob?.cancel()
             gattQueue.clear()
             inFlightOpId = 0L
+            pendingAmsTruncatedTarget = null
             isConnectingOrConnected = false
             servicesDiscoveryStarted = false
             remoteIosTelemetryChar = null
@@ -555,18 +560,25 @@ class AncsBleService : LifecycleService() {
             }
             if (activeGatt == gatt) activeGatt = null
 
+            // Evitar companionConnected stale, que dejaba el advertising apagado en READY.
+            _phoneContext.update {
+                it.copy(companionConnected = subscribedCompanionDevices.isNotEmpty())
+            }
+            if (activeGatt == null && subscribedCompanionDevices.isEmpty()) {
+                updateConnectionState(BleConnectionState.DISCONNECTED)
+            }
             updateAdvertisingStateForCurrentLink()
 
-            if (subscribedCompanionDevices.isEmpty()) {
-                updateConnectionState(BleConnectionState.DISCONNECTED)
+            // Reconectar el cliente ANCS aunque el iPhone siga suscrito al GATT server del reloj.
+            if (activeGatt == null && _autoReconnect.value) {
                 scheduleExponentialBackoffReconnect()
             }
         }
     }
 
     /**
-     * Escaneo BLE único con callback y corte estricto a los 15s o al conectar, evitando dejar
-     * escaneos duplicados por PendingIntent encendidos en segundo plano.
+     * Escaneo BLE con ventana de 15s por callback + PendingIntent pasivo en hardware mientras está
+     * desconectado (que se frena explícitamente al conectar en stopPassiveHardwareScan()).
      */
     private fun startHardwareFilteredLowPowerScan(adapter: BluetoothAdapter, targetMac: String?) {
         scanner = adapter.bluetoothLeScanner ?: return
@@ -590,6 +602,7 @@ class AncsBleService : LifecycleService() {
             .build()
 
         runCatching { scanner?.startScan(filters, settings, lowPowerScanCallback) }
+        armPassiveHardwareScanIfNeeded(filters, settings)
 
         scanTimeoutJob?.cancel()
         scanTimeoutJob = lifecycleScope.launch(Dispatchers.Main.immediate) {
@@ -601,6 +614,34 @@ class AncsBleService : LifecycleService() {
     private fun stopActiveLowPowerScan() {
         scanTimeoutJob?.cancel()
         runCatching { scanner?.stopScan(lowPowerScanCallback) }
+    }
+
+    private fun armPassiveHardwareScanIfNeeded(filters: List<ScanFilter>, settings: ScanSettings) {
+        if (isPassiveScanArmed || _connectionState.value == BleConnectionState.READY) return
+        val result = runCatching {
+            scanner?.startScan(filters, settings, buildPassiveScanPendingIntent())
+        }.getOrNull()
+        if (result == BluetoothStatusCodes.SUCCESS) {
+            isPassiveScanArmed = true
+        }
+    }
+
+    private fun stopPassiveHardwareScan() {
+        if (!isPassiveScanArmed) return
+        isPassiveScanArmed = false
+        runCatching { scanner?.stopScan(buildPassiveScanPendingIntent()) }
+    }
+
+    private fun buildPassiveScanPendingIntent(): PendingIntent {
+        val intent = Intent(this, BlePassiveScanReceiver::class.java).apply {
+            action = BlePassiveScanReceiver.ACTION_PASSIVE_BLE_FOUND
+        }
+        return PendingIntent.getBroadcast(
+            this,
+            901,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+        )
     }
 
     private val lowPowerScanCallback = object : ScanCallback() {
@@ -1210,12 +1251,22 @@ class AncsBleService : LifecycleService() {
                 delay(220L)
             }
 
-            activeGatt = device.connectGatt(
-                this@AncsBleService,
-                autoConnect,
-                gattClientCallback,
-                BluetoothDevice.TRANSPORT_LE
-            )
+            val gatt = runCatching {
+                device.connectGatt(
+                    this@AncsBleService,
+                    autoConnect,
+                    gattClientCallback,
+                    BluetoothDevice.TRANSPORT_LE
+                )
+            }.getOrNull()
+            activeGatt = gatt
+            if (gatt == null) {
+                isConnectingOrConnected = false
+                if (_autoReconnect.value) {
+                    scheduleExponentialBackoffReconnect()
+                }
+                return@launch
+            }
 
             connectionWatchdogJob?.cancel()
             val watchdogTimeoutMs = if (autoConnect) 55_000L else 25_000L
@@ -1246,11 +1297,14 @@ class AncsBleService : LifecycleService() {
         }
     }
 
+    @Synchronized
     private fun proceedToBondOrDiscover(gatt: BluetoothGatt) {
         mtuFallbackJob?.cancel()
         if (gatt.device.bondState != BluetoothDevice.BOND_BONDED) {
             updateConnectionState(BleConnectionState.BONDING)
-            gatt.device.createBond()
+            if (gatt.device.bondState == BluetoothDevice.BOND_NONE) {
+                gatt.device.createBond()
+            }
         } else if (!servicesDiscoveryStarted) {
             servicesDiscoveryStarted = true
             gatt.discoverServices()
@@ -1278,6 +1332,7 @@ class AncsBleService : LifecycleService() {
                     reconnectJob?.cancel()
                     connectionWatchdogJob?.cancel()
                     stopActiveLowPowerScan()
+                    stopPassiveHardwareScan()
 
                     saveTargetIphoneMac(gatt.device.address)
                     updateDetectedPhoneName(gatt.device.name, null)
@@ -1435,6 +1490,16 @@ class AncsBleService : LifecycleService() {
                         updateDetectedPhoneName(null, String(value, StandardCharsets.UTF_8).trim())
                     AppleBleUuids.CTS_CURRENT_TIME_CHAR -> handleCtsTimePayload(value)
                     AppleBleUuids.BAS_BATTERY_LEVEL_CHAR -> handleIphoneBatteryPayload(value)
+                    AppleBleUuids.AMS_ENTITY_ATTRIBUTE -> {
+                        val target = pendingAmsTruncatedTarget
+                        if (target != null && value.isNotEmpty()) {
+                            pendingAmsTruncatedTarget = null
+                            _nowPlaying.update { current ->
+                                AmsEntityParser.applyFullEntityAttribute(current, target.first, target.second, value)
+                            }
+                            scheduleThrottledMediaSync()
+                        }
+                    }
                     AppleBleUuids.BRIDGE_COMMAND_CONFIG_CHAR -> {
                         if (value.isNotEmpty()) {
                             handleCompanionBleCommand(String(value, StandardCharsets.UTF_8))
@@ -1463,7 +1528,11 @@ class AncsBleService : LifecycleService() {
                 AppleBleUuids.CTS_CURRENT_TIME_CHAR -> handleCtsTimePayload(value)
                 AppleBleUuids.BAS_BATTERY_LEVEL_CHAR -> handleIphoneBatteryPayload(value)
                 AppleBleUuids.AMS_ENTITY_UPDATE -> {
-                    _nowPlaying.update { current -> AmsEntityParser.applyEntityUpdate(current, value) }
+                    val updated = AmsEntityParser.applyEntityUpdate(_nowPlaying.value, value)
+                    _nowPlaying.value = updated
+                    if (updated.isTruncated && value.size >= 2) {
+                        requestFullAmsEntityAttribute(gatt, value[0], value[1])
+                    }
                     scheduleThrottledMediaSync()
                 }
                 AppleBleUuids.BRIDGE_COMMAND_CONFIG_CHAR -> {
@@ -1473,6 +1542,23 @@ class AncsBleService : LifecycleService() {
                 }
             }
         }
+    }
+
+    private fun requestFullAmsEntityAttribute(gatt: BluetoothGatt, entityId: Byte, attrId: Byte) {
+        val entityAttrChar = gatt.getService(AppleBleUuids.AMS_SERVICE)
+            ?.getCharacteristic(AppleBleUuids.AMS_ENTITY_ATTRIBUTE) ?: return
+        pendingAmsTruncatedTarget = (entityId.toInt() and 0xFF) to (attrId.toInt() and 0xFF)
+        enqueueGattOperation(
+            GattOperation.WriteCharacteristic(
+                entityAttrChar,
+                AmsEntityParser.buildEntityAttributeCommand(entityId, attrId),
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT,
+                nextGattOpId.incrementAndGet()
+            )
+        )
+        enqueueGattOperation(
+            GattOperation.ReadCharacteristic(entityAttrChar, nextGattOpId.incrementAndGet())
+        )
     }
 
     private fun scheduleThrottledMediaSync() {

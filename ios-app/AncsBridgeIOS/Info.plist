@@ -23,13 +23,19 @@
     <key>LSRequiresIPhoneOS</key>
     <true/>
     <key>NSBluetoothAlwaysUsageDescription</key>
-    <string>Watch Bridge usa Bluetooth para conectar tu iPhone con tu Galaxy Watch 6 Classic en tiempo real y en segundo plano.</string>
+    <string>Watch Bridge usa Bluetooth para conectar tu iPhone con tu reloj Wear OS en tiempo real y en segundo plano.</string>
     <key>NSBluetoothPeripheralUsageDescription</key>
-    <string>Watch Bridge usa Bluetooth para sincronizar notificaciones, controles y datos de tu balanza Femmto con tu Galaxy Watch 6 Classic.</string>
+    <string>Watch Bridge usa Bluetooth para sincronizar notificaciones, controles y datos de Apple Salud con tu reloj Wear OS.</string>
     <key>NSHealthShareUsageDescription</key>
-    <string>Watch Bridge lee tu peso, porcentaje de grasa corporal e IMC registrados por la app de tu balanza Femmto para enviarlos a tu Galaxy Watch.</string>
+    <string>Watch Bridge lee tu peso, porcentaje de grasa corporal e IMC de Apple Salud para mostrarlos en tu reloj Wear OS.</string>
     <key>NSHealthUpdateUsageDescription</key>
-    <string>Watch Bridge guarda en Apple Salud los pasos y la frecuencia cardíaca medidos por tu Galaxy Watch 6 Classic.</string>
+    <string>Watch Bridge guarda en Apple Salud los pasos y la frecuencia cardíaca medidos por tu reloj Wear OS.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Watch Bridge abre una cámara dentro de la app para que puedas disparar una foto desde tu reloj y guardarla en el carrete.</string>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>Watch Bridge guarda en el carrete las fotos tomadas con la cámara remota del reloj.</string>
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>Watch Bridge guarda en el carrete las fotos tomadas con la cámara remota del reloj.</string>
     <key>NSCalendarsFullAccessUsageDescription</key>
     <string>Watch Bridge muestra tu próximo evento del calendario en la pantalla de tu Galaxy Watch.</string>
     <key>CFBundleURLTypes</key>

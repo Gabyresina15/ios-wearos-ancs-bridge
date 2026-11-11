@@ -47,6 +47,7 @@ object AppleBleUuids {
     val BRIDGE_TELEMETRY_CHAR: UUID = UUID.fromString("d973f2e1-b19e-11e2-9e96-0800200c9a66")
     val BRIDGE_COMMAND_CONFIG_CHAR: UUID = UUID.fromString("d973f2e2-b19e-11e2-9e96-0800200c9a66")
     val BRIDGE_WATCH_EVENT_CHAR: UUID = UUID.fromString("d973f2e3-b19e-11e2-9e96-0800200c9a66")
+    val BRIDGE_NOTIF_MODE_CHAR: UUID = UUID.fromString("d973f2e4-b19e-11e2-9e96-0800200c9a66")
 }
 
 /**
@@ -152,15 +153,56 @@ object AppleDeviceModelResolver {
     }
 }
 
+enum class AmsPlaybackState(val code: Int) {
+    PAUSED(0),
+    PLAYING(1),
+    REWINDING(2),
+    FAST_FORWARDING(3);
+
+    val isActivelyPlaying: Boolean
+        get() = this == PLAYING || this == REWINDING || this == FAST_FORWARDING
+
+    companion object {
+        fun fromCode(code: Int): AmsPlaybackState =
+            entries.firstOrNull { it.code == code } ?: PAUSED
+    }
+}
+
 data class NowPlayingState(
-    val title: String = "Sin reproducción",
-    val artist: String = "Control multimedia",
+    val title: String = "",
+    val artist: String = "",
     val album: String = "",
     val playerName: String = "",
     val volumePercent: Int? = null,
-    val isPlaying: Boolean = false,
+    val playbackState: AmsPlaybackState = AmsPlaybackState.PAUSED,
+    val playbackRate: Double = 0.0,
+    val elapsedSeconds: Double = 0.0,
+    val lastTitle: String = "",
+    val lastArtist: String = "",
     val isTruncated: Boolean = false
-)
+) {
+    val isPlaying: Boolean get() = playbackState.isActivelyPlaying
+    val isIdle: Boolean get() = !isPlaying
+}
+
+enum class WatchNotificationMode(val wireValue: String, val displayLabel: String) {
+    NORMAL("normal", "Normal"),
+    MUTE("mute", "Silencio"),
+    DND("dnd", "No molestar");
+
+    val pausesAlerts: Boolean get() = this != NORMAL
+    val blocksDelivery: Boolean get() = this == DND
+
+    companion object {
+        fun fromWire(value: String?): WatchNotificationMode? {
+            if (value.isNullOrBlank()) return null
+            return entries.firstOrNull { it.wireValue.equals(value, ignoreCase = true) }
+        }
+
+        fun fromLegacyMutedFlag(muted: Boolean): WatchNotificationMode =
+            if (muted) DND else NORMAL
+    }
+}
 
 data class PhoneContextState(
     val phoneBatteryPercent: Int? = null,
@@ -220,6 +262,20 @@ object AmsEntityParser {
     // Entity 2 (Track): Attribute 0 = Artist, Attribute 1 = Album, Attribute 2 = Title
     val SUBSCRIBE_TRACK_ARTIST_AND_TITLE = byteArrayOf(0x02, 0x00, 0x01, 0x02)
 
+    data class PlaybackInfo(
+        val state: AmsPlaybackState,
+        val rate: Double,
+        val elapsedSeconds: Double
+    )
+
+    fun parsePlaybackInfo(raw: String): PlaybackInfo {
+        val parts = raw.split(',').map { it.trim() }
+        val state = AmsPlaybackState.fromCode(parts.getOrNull(0)?.toIntOrNull() ?: 0)
+        val rate = parts.getOrNull(1)?.toDoubleOrNull() ?: 0.0
+        val elapsed = parts.getOrNull(2)?.toDoubleOrNull() ?: 0.0
+        return PlaybackInfo(state, rate, elapsed)
+    }
+
     fun applyEntityUpdate(current: NowPlayingState, bytes: ByteArray): NowPlayingState {
         if (bytes.size < 3) return current
         val entityId = bytes[0].toInt() and 0xFF
@@ -245,6 +301,8 @@ object AmsEntityParser {
         return applyAttributeText(current, entityId, attrId, textValue).copy(isTruncated = false)
     }
 
+    fun clearedForDisconnect(): NowPlayingState = NowPlayingState()
+
     private fun applyAttributeText(
         current: NowPlayingState,
         entityId: Int,
@@ -253,11 +311,23 @@ object AmsEntityParser {
     ): NowPlayingState = when (entityId) {
         0 -> {
             when (attrId) {
-                0 -> current.copy(playerName = textValue)
-                1 -> {
-                    val stateCode = textValue.substringBefore(',').toIntOrNull() ?: 0
-                    current.copy(isPlaying = (stateCode == 1))
+                0 -> {
+                    if (textValue.isEmpty()) {
+                        current.copy(
+                            playerName = "",
+                            title = "",
+                            artist = "",
+                            album = "",
+                            lastTitle = "",
+                            lastArtist = "",
+                            playbackState = AmsPlaybackState.PAUSED,
+                            playbackRate = 0.0
+                        )
+                    } else {
+                        current.copy(playerName = textValue)
+                    }
                 }
+                1 -> applyPlaybackInfo(current, textValue)
                 2 -> {
                     val volFloat = textValue.toFloatOrNull()
                     val pct = volFloat?.let { (it * 100f).roundToInt().coerceIn(0, 100) }
@@ -266,15 +336,53 @@ object AmsEntityParser {
                 else -> current
             }
         }
-        2 -> {
+        2 -> applyTrackAttribute(current, attrId, textValue)
+        else -> current
+    }
+
+    private fun applyPlaybackInfo(current: NowPlayingState, raw: String): NowPlayingState {
+        val info = parsePlaybackInfo(raw)
+        val wasPlaying = current.isPlaying
+        val updated = current.copy(
+            playbackState = info.state,
+            playbackRate = info.rate,
+            elapsedSeconds = info.elapsedSeconds
+        )
+        return if (!info.state.isActivelyPlaying && (wasPlaying || updated.title.isNotEmpty() || updated.artist.isNotEmpty())) {
+            enterIdle(updated)
+        } else {
+            updated
+        }
+    }
+
+    private fun enterIdle(current: NowPlayingState): NowPlayingState {
+        val lastTitle = current.title.ifBlank { current.lastTitle }
+        val lastArtist = current.artist.ifBlank { current.lastArtist }
+        return current.copy(
+            title = "",
+            artist = "",
+            album = "",
+            lastTitle = lastTitle,
+            lastArtist = lastArtist
+        )
+    }
+
+    private fun applyTrackAttribute(current: NowPlayingState, attrId: Int, textValue: String): NowPlayingState {
+        return if (current.isPlaying) {
             when (attrId) {
-                0 -> current.copy(artist = textValue.ifEmpty { "Artista desconocido" })
+                0 -> current.copy(artist = textValue, lastArtist = textValue.ifBlank { current.lastArtist })
                 1 -> current.copy(album = textValue)
-                2 -> current.copy(title = textValue.ifEmpty { "Reproduciendo" })
+                2 -> current.copy(title = textValue, lastTitle = textValue.ifBlank { current.lastTitle })
+                else -> current
+            }
+        } else {
+            when (attrId) {
+                0 -> current.copy(lastArtist = textValue, artist = "")
+                1 -> current.copy(album = "")
+                2 -> current.copy(lastTitle = textValue, title = "")
                 else -> current
             }
         }
-        else -> current
     }
 }
 

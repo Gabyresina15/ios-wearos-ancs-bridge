@@ -13,9 +13,11 @@ struct ContentView: View {
     @StateObject private var ble = WatchBleCentralManager.shared
     @StateObject private var health = HealthKitSyncManager.shared
     @StateObject private var alarm = PhoneFindMyAlarmManager.shared
+    @StateObject private var camera = RemoteCameraController.shared
 
     @State private var selectedTab: Int = 0
     @State private var showFemmtoSheet: Bool = false
+    @State private var showDiagnostics: Bool = false
     @State private var appSearchText: String = ""
 
     // Campos del modal de Balanza Femmto
@@ -36,7 +38,7 @@ struct ContentView: View {
 
                 healthAndFemmtoTab
                     .tabItem {
-                        Label("Salud & Femmto", systemImage: "heart.text.square.fill")
+                        Label("Apple Health", systemImage: "heart.text.square.fill")
                     }
                     .tag(1)
 
@@ -66,6 +68,9 @@ struct ContentView: View {
             femmtoEditorSheet
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
+        }
+        .fullScreenCover(isPresented: $camera.isPresented) {
+            RemoteCameraScreen()
         }
         .onAppear {
             health.requestAuthorizationIfNeeded()
@@ -115,6 +120,7 @@ struct ContentView: View {
                     notificationsMasterPauseCard
                     quickActionsGrid
                     mediaRemoteCard
+                    diagnosticsCard
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 10)
@@ -207,29 +213,31 @@ struct ContentView: View {
             }
 
             HStack(spacing: 10) {
-                Button {
-                    ble.reconnect()
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "arrow.triangle.2.circlepath")
-                        Text(ble.isSyncing ? "Sincronizando…" : (ble.isConnected ? "Sincronizar ahora" : "Conectar reloj"))
-                    }
-                    .font(.caption.bold())
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 11)
-                    .background(
-                        LinearGradient(
-                            colors: [accentEmerald.opacity(0.25), accentCyan.opacity(0.25)],
-                            startPoint: .leading,
-                            endPoint: .trailing
+                if !ble.isConnected {
+                    Button {
+                        ble.reconnect()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                            Text(ble.isSyncing ? "Reconectando…" : "Reconectar")
+                        }
+                        .font(.caption.bold())
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 11)
+                        .background(
+                            LinearGradient(
+                                colors: [accentEmerald.opacity(0.25), accentCyan.opacity(0.25)],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
                         )
-                    )
-                    .foregroundStyle(.white)
-                    .clipShape(RoundedRectangle(cornerRadius: 14))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 14)
-                            .stroke(accentEmerald.opacity(0.45), lineWidth: 1)
-                    )
+                        .foregroundStyle(.white)
+                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 14)
+                                .stroke(accentEmerald.opacity(0.45), lineWidth: 1)
+                        )
+                    }
                 }
 
                 Button {
@@ -260,45 +268,67 @@ struct ContentView: View {
     // MARK: - Interruptor Maestro para Silenciar / Pausar Notificaciones en el Reloj
 
     private var notificationsMasterPauseCard: some View {
-        let isMuted = ble.telemetry.dnd
-        return HStack(spacing: 14) {
-            ZStack {
-                Circle()
-                    .fill(isMuted ? accentCoral.opacity(0.18) : accentEmerald.opacity(0.18))
-                    .frame(width: 46, height: 46)
-                Image(systemName: isMuted ? "bell.slash.fill" : "bell.badge.fill")
-                    .font(.title3)
-                    .foregroundStyle(isMuted ? accentCoral : accentEmerald)
+        let mode = ble.notificationMode
+        let connected = ble.isConnected
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 14) {
+                ZStack {
+                    Circle()
+                        .fill(mode == .normal ? accentEmerald.opacity(0.18) : accentCoral.opacity(0.18))
+                        .frame(width: 46, height: 46)
+                    Image(systemName: mode == .normal ? "bell.badge.fill" : (mode == .mute ? "bell.slash.fill" : "moon.fill"))
+                        .font(.title3)
+                        .foregroundStyle(mode == .normal ? accentEmerald : accentCoral)
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Notificaciones en el reloj")
+                        .font(.subheadline.bold())
+                        .foregroundStyle(.white)
+                    Text(notificationModeCaption(mode))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
             }
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text(isMuted ? "Notificaciones Pausadas en el Reloj" : "Notificaciones Activas en el Reloj")
-                    .font(.subheadline.bold())
-                    .foregroundStyle(.white)
-                Text(isMuted
-                     ? "No saldrán alertas ni el punto naranja en \(ble.watchName) hasta que lo actives."
-                     : "Los mensajes aparecen y vibran en \(ble.watchName).")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            Spacer()
-
-            Toggle("", isOn: Binding(
-                get: { !isMuted },
-                set: { active in ble.setWatchMuted(!active) }
-            ))
-            .labelsHidden()
-            .tint(accentEmerald)
+            notificationModePicker
+                .disabled(!connected)
+                .opacity(connected ? 1 : 0.45)
         }
         .padding(16)
         .background(cardSurface)
         .clipShape(RoundedRectangle(cornerRadius: 24))
         .overlay(
             RoundedRectangle(cornerRadius: 24)
-                .stroke(isMuted ? accentCoral.opacity(0.4) : accentEmerald.opacity(0.3), lineWidth: 1)
+                .stroke(mode == .normal ? accentEmerald.opacity(0.3) : accentCoral.opacity(0.4), lineWidth: 1)
         )
+    }
+
+    private var notificationModePicker: some View {
+        Picker("Modo", selection: Binding(
+            get: { ble.notificationMode },
+            set: { mode in ble.setNotificationMode(mode) }
+        )) {
+            ForEach(WatchNotificationMode.allCases, id: \.self) { mode in
+                Text(mode.title).tag(mode)
+            }
+        }
+        .pickerStyle(.segmented)
+        .disabled(!ble.isConnected)
+    }
+
+    private func notificationModeCaption(_ mode: WatchNotificationMode) -> String {
+        guard ble.isConnected else {
+            return "El interruptor se habilita al conectar el reloj. El modo lo define el reloj."
+        }
+        switch mode {
+        case .normal:
+            return "Los mensajes aparecen y vibran en \(ble.watchName)."
+        case .mute:
+            return "Las alertas se publican en silencio, sin sonido ni vibración."
+        case .dnd:
+            return "El reloj sigue suscrito a ANCS, pero no pide atributos ni publica alertas."
+        }
     }
 
     // MARK: - Grilla de Acciones Rápidas
@@ -315,8 +345,8 @@ struct ContentView: View {
             }
 
             quickActionButton(
-                title: "Balanza Femmto",
-                subtitle: health.bodyComposition.weightKg.map { String(format: "%.1f kg", $0) } ?? "Cargar pesada",
+                title: "Composición corporal",
+                subtitle: health.bodyComposition.weightKg.map { String(format: "%.1f kg", $0) } ?? "Cargar medición",
                 icon: "scalemass.fill",
                 tint: accentCyan
             ) {
@@ -331,15 +361,6 @@ struct ContentView: View {
                 tint: accentAmber
             ) {
                 ble.clearWatchNotifications()
-            }
-
-            quickActionButton(
-                title: "Probar Sirena",
-                subtitle: alarm.isRinging ? "Detener alarma" : "Alarma local iOS",
-                icon: "megaphone.fill",
-                tint: accentEmerald
-            ) {
-                alarm.triggerFindPhoneAlarm()
             }
         }
     }
@@ -404,31 +425,55 @@ struct ContentView: View {
             }
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(ble.telemetry.mTitle)
-                    .font(.subheadline.bold())
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-                Text(ble.telemetry.mArtist)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                if ble.telemetry.isMediaIdle {
+                    Text("Nada sonando en este iPhone")
+                        .font(.subheadline.bold())
+                        .foregroundStyle(.white)
+                    if !ble.telemetry.mTitle.isEmpty || !ble.telemetry.mArtist.isEmpty {
+                        Text([ble.telemetry.mTitle, ble.telemetry.mArtist].filter { !$0.isEmpty }.joined(separator: " · "))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                } else {
+                    Text(ble.telemetry.mTitle.isEmpty ? "Reproduciendo" : ble.telemetry.mTitle)
+                        .font(.subheadline.bold())
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    Text(ble.telemetry.mArtist)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
 
             HStack(spacing: 10) {
                 mediaButton(icon: "speaker.minus.fill", action: "VOLUME_DOWN")
                 mediaButton(icon: "backward.fill", action: "PREVIOUS_TRACK")
                 Button {
-                    ble.sendMediaCommand("TOGGLE_PLAY_PAUSE")
+                    ble.sendMediaCommand(ble.telemetry.isMediaIdle ? "PLAY" : "PAUSE")
                 } label: {
-                    Image(systemName: ble.telemetry.mPlay ? "pause.fill" : "play.fill")
-                        .font(.body.bold())
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
-                        .background(
-                            LinearGradient(colors: [accentEmerald, accentCyan], startPoint: .leading, endPoint: .trailing)
-                        )
-                        .foregroundStyle(.black)
-                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                    if ble.telemetry.isMediaIdle {
+                        Text("Reproducir en el iPhone")
+                            .font(.caption.bold())
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(
+                                LinearGradient(colors: [accentEmerald, accentCyan], startPoint: .leading, endPoint: .trailing)
+                            )
+                            .foregroundStyle(.black)
+                            .clipShape(RoundedRectangle(cornerRadius: 14))
+                    } else {
+                        Image(systemName: "pause.fill")
+                            .font(.body.bold())
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(
+                                LinearGradient(colors: [accentEmerald, accentCyan], startPoint: .leading, endPoint: .trailing)
+                            )
+                            .foregroundStyle(.black)
+                            .clipShape(RoundedRectangle(cornerRadius: 14))
+                    }
                 }
                 mediaButton(icon: "forward.fill", action: "NEXT_TRACK")
                 mediaButton(icon: "speaker.plus.fill", action: "VOLUME_UP")
@@ -457,8 +502,37 @@ struct ContentView: View {
         }
     }
 
+    private var diagnosticsCard: some View {
+        DisclosureGroup(isExpanded: $showDiagnostics) {
+            Button {
+                alarm.triggerFindPhoneAlarm()
+            } label: {
+                HStack {
+                    Image(systemName: "megaphone.fill")
+                    Text(alarm.isRinging ? "Detener alarma local" : "Probar alarma local")
+                    Spacer()
+                }
+                .font(.caption.bold())
+                .foregroundStyle(alarm.isRinging ? accentCoral : .white)
+                .padding(.vertical, 10)
+            }
+        } label: {
+            Label("Diagnóstico", systemImage: "stethoscope")
+                .font(.caption.bold())
+                .foregroundStyle(.secondary)
+        }
+        .padding(16)
+        .background(cardSurface)
+        .clipShape(RoundedRectangle(cornerRadius: 24))
+        .overlay(
+            RoundedRectangle(cornerRadius: 24)
+                .stroke(cardStroke, lineWidth: 1)
+        )
+    }
+
     // =========================================================================
-    // PESTAÑA 2: SALUD DEL RELOJ + BALANZA INTELIGENTE FEMMTO
+    // PESTAÑA 2: SALUD DEL RELOJ + APPLE HEALTH
+
     // =========================================================================
 
     private var healthAndFemmtoTab: some View {
@@ -467,14 +541,13 @@ struct ContentView: View {
                 VStack(spacing: 16) {
                     watchActivityCard
                     femmtoScaleCard
-                    femmtoShortcutGuideCard
                 }
                 .padding(.horizontal, 16)
                 .padding(.top, 10)
                 .padding(.bottom, 32)
             }
             .background(bgObsidian)
-            .navigationTitle("Salud y Femmto")
+            .navigationTitle("Apple Health")
             .navigationBarTitleDisplayMode(.inline)
         }
     }
@@ -525,9 +598,14 @@ struct ContentView: View {
                     HStack(spacing: 6) {
                         Image(systemName: "heart.fill")
                             .foregroundStyle(accentCoral)
-                        Text(ble.telemetry.hr > 0 ? "\(ble.telemetry.hr) BPM" : "-- BPM")
-                            .font(.headline.bold())
-                            .foregroundStyle(.white)
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text(ble.telemetry.hr > 0 ? "\(ble.telemetry.hr) BPM" : "Sin dato aún")
+                                .font(.headline.bold())
+                                .foregroundStyle(.white)
+                            Text("Último pulso recibido")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                     HStack(spacing: 6) {
                         Image(systemName: "location.fill")
@@ -568,7 +646,7 @@ struct ContentView: View {
                     HStack(spacing: 6) {
                         Image(systemName: "scalemass.fill")
                             .foregroundStyle(accentCyan)
-                        Text("Balanza Inteligente Femmto")
+                        Text("Composición corporal")
                             .font(.subheadline.bold())
                             .foregroundStyle(.white)
                     }
@@ -577,7 +655,7 @@ struct ContentView: View {
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     } else {
-                        Text("Sincronizá desde Salud o cargá tu pesada de Femmto para verla en \(ble.watchName)")
+                        Text("Leé Apple Health o cargá una medición para verla en \(ble.watchName)")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
@@ -599,7 +677,7 @@ struct ContentView: View {
                 } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "plus.circle.fill")
-                        Text("Actualizar pesada Femmto")
+                        Text("Cargar medición")
                     }
                     .font(.caption.bold())
                     .frame(maxWidth: .infinity)
@@ -621,7 +699,7 @@ struct ContentView: View {
                 } label: {
                     HStack(spacing: 6) {
                         Image(systemName: "arrow.clockwise.heart.fill")
-                        Text("Leer Salud")
+                        Text("Leer Apple Health")
                     }
                     .font(.caption.bold())
                     .padding(.horizontal, 14)
@@ -661,41 +739,12 @@ struct ContentView: View {
         .clipShape(RoundedRectangle(cornerRadius: 16))
     }
 
-    private var femmtoShortcutGuideCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Image(systemName: "bolt.badge.automatic.fill")
-                    .foregroundStyle(accentEmerald)
-                Text("Tip: Automatización con la app Femmto")
-                    .font(.caption.bold())
-                    .foregroundStyle(.white)
-            }
-            Text("Si en la app Atajos creás una Automatización personal 'Al cerrar la app Femmto' → 'Buscar muestras de Salud (Peso y % Grasa)' → 'Abrir URL':")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            Text("watchbridge://femmto?wt=[Peso]&fat=[Grasa]")
-                .font(.system(.caption2, design: .monospaced))
-                .foregroundStyle(accentCyan)
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(cardElevated)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
-        }
-        .padding(16)
-        .background(cardSurface)
-        .clipShape(RoundedRectangle(cornerRadius: 22))
-        .overlay(
-            RoundedRectangle(cornerRadius: 22)
-                .stroke(cardStroke, lineWidth: 1)
-        )
-    }
-
     // MARK: - Modal de Carga Rápida Balanza Femmto
 
     private var femmtoEditorSheet: some View {
         NavigationStack {
             Form {
-                Section("Medición de tu balanza Femmto") {
+                Section("Medición de composición corporal") {
                     HStack {
                         Text("Peso corporal (kg)")
                         Spacer()
@@ -732,10 +781,10 @@ struct ContentView: View {
                     }
                     .tint(accentEmerald)
                 } footer: {
-                    Text("Calcula automáticamente tu IMC y tu Masa Magra y actualiza la tarjeta de Femmto en \(ble.watchName).")
+                    Text("Calcula automáticamente tu IMC y tu masa magra y actualiza la tarjeta en \(ble.watchName).")
                 }
             }
-            .navigationTitle("Balanza Femmto")
+            .navigationTitle("Composición corporal")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -764,7 +813,7 @@ struct ContentView: View {
         let f = Double(cleanFat)
         let h = Double(cleanHeight)
 
-        health.saveFemmtoMeasurement(weightKg: w, bodyFatPercent: f, heightCm: h, source: "Femmto")
+        health.saveBodyMeasurement(weightKg: w, bodyFatPercent: f, heightCm: h, source: "Apple Health")
         ble.sendBodyComposition(health.bodyComposition)
         showFemmtoSheet = false
     }
@@ -785,25 +834,13 @@ struct ContentView: View {
         NavigationStack {
             List {
                 Section {
-                    HStack(spacing: 12) {
-                        Image(systemName: ble.telemetry.dnd ? "bell.slash.fill" : "bell.badge.fill")
-                            .foregroundStyle(ble.telemetry.dnd ? accentCoral : accentEmerald)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Mostrar notificaciones en el reloj")
-                                .font(.body.weight(.semibold))
-                            Text(ble.telemetry.dnd
-                                 ? "Pausadas: no saldrá ningún mensaje ni punto naranja"
-                                 : "Activas: el reloj muestra las apps habilitadas abajo")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Toggle("", isOn: Binding(
-                            get: { !ble.telemetry.dnd },
-                            set: { enabled in ble.setWatchMuted(!enabled) }
-                        ))
-                        .labelsHidden()
-                        .tint(accentEmerald)
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Modo de notificaciones del reloj")
+                            .font(.body.weight(.semibold))
+                        Text(notificationModeCaption(ble.notificationMode))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        notificationModePicker
                     }
                 } header: {
                     Text("Interruptor General")

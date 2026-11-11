@@ -242,7 +242,8 @@ class AncsParserTest {
             NowPlayingState(),
             amsUpdate(entity = 2, attr = 2, "Titulo cortado", flags = 0x01)
         )
-        assertEquals("Titulo cortado", state.title)
+        assertEquals("", state.title)
+        assertEquals("Titulo cortado", state.lastTitle)
         assertTrue(state.isTruncated)
 
         val cmd = AmsEntityParser.buildEntityAttributeCommand(2, 2)
@@ -256,7 +257,7 @@ class AncsParserTest {
             attrId = 2,
             rawValue = "Título completo sin truncamiento desde EntityAttribute".toByteArray(StandardCharsets.UTF_8)
         )
-        assertEquals("Título completo sin truncamiento desde EntityAttribute", fullState.title)
+        assertEquals("Título completo sin truncamiento desde EntityAttribute", fullState.lastTitle)
         assertFalse(fullState.isTruncated)
     }
 
@@ -322,6 +323,87 @@ class AncsParserTest {
                 putShort(nameBytes.size.toShort())
                 put(nameBytes)
             }.array()
+    }
+
+
+    @Test
+    fun amsPlaybackInfo_parsesStateRateAndElapsed() {
+        val info = AmsEntityParser.parsePlaybackInfo("1,1.25,42.5")
+        assertEquals(AmsPlaybackState.PLAYING, info.state)
+        assertEquals(1.25, info.rate, 0.0001)
+        assertEquals(42.5, info.elapsedSeconds, 0.0001)
+
+        val paused = AmsEntityParser.parsePlaybackInfo("0,0,10")
+        assertEquals(AmsPlaybackState.PAUSED, paused.state)
+        assertEquals(0.0, paused.rate, 0.0001)
+        assertEquals(10.0, paused.elapsedSeconds, 0.0001)
+
+        val ff = AmsEntityParser.parsePlaybackInfo("3,2.0,1")
+        assertEquals(AmsPlaybackState.FAST_FORWARDING, ff.state)
+        assertTrue(ff.state.isActivelyPlaying)
+
+        val empty = AmsEntityParser.parsePlaybackInfo("")
+        assertEquals(AmsPlaybackState.PAUSED, empty.state)
+        assertFalse(empty.state.isActivelyPlaying)
+    }
+
+    @Test
+    fun amsEntityParser_clearsLiveTrackWhenPlaybackGoesIdle() {
+        var state = NowPlayingState()
+        state = AmsEntityParser.applyEntityUpdate(state, amsUpdate(entity = 0, attr = 1, "1,1.0,8"))
+        state = AmsEntityParser.applyEntityUpdate(state, amsUpdate(entity = 2, attr = 2, "Bohemian Rhapsody"))
+        state = AmsEntityParser.applyEntityUpdate(state, amsUpdate(entity = 2, attr = 0, "Queen"))
+        assertTrue(state.isPlaying)
+        assertEquals("Bohemian Rhapsody", state.title)
+
+        state = AmsEntityParser.applyEntityUpdate(state, amsUpdate(entity = 0, attr = 1, "0,0,8"))
+        assertTrue(state.isIdle)
+        assertFalse(state.isPlaying)
+        assertEquals("", state.title)
+        assertEquals("", state.artist)
+        assertEquals("Bohemian Rhapsody", state.lastTitle)
+        assertEquals("Queen", state.lastArtist)
+    }
+
+    @Test
+    fun amsEntityParser_clearsTrackWhenPlayerNameEmpties() {
+        var state = NowPlayingState(playerName = "Spotify", title = "Song", artist = "Artist")
+        state = AmsEntityParser.applyEntityUpdate(state, amsUpdate(entity = 0, attr = 0, ""))
+        assertEquals("", state.playerName)
+        assertEquals("", state.title)
+        assertEquals("", state.lastTitle)
+        assertTrue(state.isIdle)
+    }
+
+    @Test
+    fun notificationMode_stateMachineAndCommandEncoding() {
+        assertEquals(WatchNotificationMode.DND, WatchNotificationMode.fromLegacyMutedFlag(true))
+        assertEquals(WatchNotificationMode.NORMAL, WatchNotificationMode.fromLegacyMutedFlag(false))
+        assertEquals(WatchNotificationMode.MUTE, WatchNotificationMode.fromWire("mute"))
+        assertNull(WatchNotificationMode.fromWire("unknown"))
+
+        val encoded = BridgeProtocol.encodeNotificationMode(WatchNotificationMode.MUTE)
+        assertEquals(WatchNotificationMode.MUTE, BridgeProtocol.decodeNotificationMode(encoded))
+        assertEquals(
+            WatchNotificationMode.DND,
+            BridgeProtocol.decodeNotificationMode("""{"v":2,"muted":true}""")
+        )
+        assertEquals(
+            WatchNotificationMode.NORMAL,
+            BridgeProtocol.decodeNotificationMode("normal")
+        )
+
+        val cmd = org.json.JSONObject(BridgeProtocol.encodeSetNotifModeCommand(WatchNotificationMode.MUTE))
+        assertEquals(2, cmd.getInt("v"))
+        assertEquals(BridgeProtocol.CMD_SET_NOTIF_MODE, cmd.getString("cmd"))
+        assertEquals(WatchNotificationMode.MUTE, BridgeProtocol.decodeModeFromCommand(cmd))
+
+        val cameraOpen = org.json.JSONObject(BridgeProtocol.encodeCameraEvent(capture = false))
+        assertEquals(BridgeProtocol.EVT_CAMERA_OPEN, cameraOpen.getString("evt"))
+        val cameraShot = org.json.JSONObject(BridgeProtocol.encodeCameraEvent(capture = true))
+        assertEquals(BridgeProtocol.EVT_CAMERA_CAPTURE, cameraShot.getString("evt"))
+        val status = org.json.JSONObject(BridgeProtocol.encodeCameraStatus(BridgeProtocol.CAMERA_STATUS_NEED_FOREGROUND))
+        assertEquals(BridgeProtocol.CAMERA_STATUS_NEED_FOREGROUND, BridgeProtocol.decodeCameraStatus(status))
     }
 
     private fun amsUpdate(entity: Int, attr: Int, text: String, flags: Int = 0): ByteArray {

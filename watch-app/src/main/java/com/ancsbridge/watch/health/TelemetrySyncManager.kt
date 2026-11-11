@@ -14,6 +14,7 @@ import androidx.health.connect.client.records.WeightRecord
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
 import com.ancsbridge.watch.ble.NowPlayingState
+import com.ancsbridge.watch.ble.WatchNotificationMode
 import com.ancsbridge.watch.ble.WearDeviceIdentityResolver
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -27,7 +28,7 @@ import kotlin.math.max
 
 enum class HealthConnectStatus(val label: String) {
     UNKNOWN("Sensores Activos"),
-    READY("Salud + Femmto Activo"),
+    READY("Apple Health activo"),
     PERMISSIONS_MISSING("Sensores Directos"),
     UNAVAILABLE("Sensores Directos OK")
 }
@@ -41,7 +42,7 @@ data class WatchTelemetrySnapshot(
     val bodyFatPercentage: Double?,
     val bmi: Double? = null,
     val leanMassKg: Double? = null,
-    val bodyCompSource: String = "Femmto",
+    val bodyCompSource: String = "Apple Health",
     val bodyCompTimestamp: Long = 0L,
     val timestamp: Long = System.currentTimeMillis()
 )
@@ -92,7 +93,7 @@ class TelemetrySyncManager(
     }
 
     /**
-     * Guarda la composición corporal enviada desde la app del iPhone (balanza inteligente Femmto / Apple Salud).
+     * Guarda la composición corporal enviada desde la app del iPhone (Apple Health).
      */
     fun saveBodyCompositionFromPhone(
         weightKg: Double?,
@@ -158,7 +159,7 @@ class TelemetrySyncManager(
         val latestBodyFatPct: Double? = prefs.getFloat("last_body_fat_pct", -1f).takeIf { it > 0f }?.toDouble()
         val latestBmi: Double? = prefs.getFloat("last_bmi", -1f).takeIf { it > 0f }?.toDouble()
         val latestLeanMass: Double? = prefs.getFloat("last_lean_mass_kg", -1f).takeIf { it > 0f }?.toDouble()
-        val bodySource = prefs.getString("last_body_src", "Femmto") ?: "Femmto"
+        val bodySource = prefs.getString("last_body_src", "Apple Health") ?: "Apple Health"
         val bodyTs = prefs.getLong("last_body_ts", 0L)
 
         val status = checkHealthConnectPermissions()
@@ -220,25 +221,30 @@ class TelemetrySyncManager(
      */
     fun toBleJson(
         snapshot: WatchTelemetrySnapshot,
-        isWatchMuted: Boolean,
+        notificationMode: WatchNotificationMode,
         isHfpConnected: Boolean,
         isHidConnected: Boolean,
         nowPlaying: NowPlayingState? = null
     ): String {
         val watchModelName = resolveWatchHardwareName()
         return JSONObject().apply {
+            put("v", 2)
             put("bat", snapshot.watchBatteryPercent)
             put("chg", snapshot.isCharging)
             put("steps", snapshot.stepsToday)
             put("hr", snapshot.latestHeartRateBpm)
-            put("dnd", isWatchMuted)
+            put("dnd", notificationMode.blocksDelivery)
+            put("notifMode", notificationMode.wireValue)
             put("hfp", isHfpConnected)
             put("hid", isHidConnected)
             put("model", watchModelName)
             if (nowPlaying != null) {
-                put("mTitle", nowPlaying.title.take(36))
-                put("mArtist", nowPlaying.artist.take(28))
+                val title = if (nowPlaying.isIdle) nowPlaying.lastTitle else nowPlaying.title
+                val artist = if (nowPlaying.isIdle) nowPlaying.lastArtist else nowPlaying.artist
+                put("mTitle", title.take(36))
+                put("mArtist", artist.take(28))
                 put("mPlay", nowPlaying.isPlaying)
+                put("mIdle", nowPlaying.isIdle)
                 nowPlaying.volumePercent?.let { put("mVol", it) }
             }
             put("ts", snapshot.timestamp)

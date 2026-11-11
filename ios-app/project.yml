@@ -31,3 +31,4 @@ targets:
       - sdk: AVFoundation.framework
       - sdk: EventKit.framework
       - sdk: UserNotifications.framework
+      - sdk: Photos.framework

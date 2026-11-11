@@ -57,6 +57,7 @@ class AncsBleService : LifecycleService() {
         private const val LEGACY_FG_CHANNEL_ID = "ancs_foreground_channel"
         private const val FG_CHANNEL_ID = "ancs_bg_link_silent_v3"
         private const val ALERTS_CHANNEL_ID = "ancs_ios_alerts_channel"
+        private const val SILENT_ALERTS_CHANNEL_ID = "ancs_ios_alerts_silent_v1"
         private const val CALLS_CHANNEL_ID = "ancs_ios_calls_channel"
         private const val FG_NOTIFICATION_ID = 1001
         private const val MAX_GATT_QUEUE_SIZE = 64
@@ -76,6 +77,7 @@ class AncsBleService : LifecycleService() {
         private const val KEY_LAST_IPHONE_BATTERY = "last_iphone_battery"
         private const val KEY_ALLOW_DND_NOTIFS = "allow_dnd_notifs"
         private const val KEY_WATCH_MUTED = "watch_notifications_muted"
+        private const val KEY_NOTIF_MODE = "watch_notification_mode"
         private const val KEY_BLOCKED_BUNDLES = "blocked_bundles_set"
         private const val KEY_CLOCK_DRIFT_MS = "cts_clock_drift_ms"
     }
@@ -89,7 +91,6 @@ class AncsBleService : LifecycleService() {
     private lateinit var notificationManager: NotificationManager
     private lateinit var hfpController: HfpCallController
     private lateinit var panController: BluetoothPanController
-    private lateinit var hidController: HidShutterController
     lateinit var telemetryManager: TelemetrySyncManager
         private set
 
@@ -98,6 +99,8 @@ class AncsBleService : LifecycleService() {
     private var gattServer: BluetoothGattServer? = null
     private var bridgeTelemetryChar: BluetoothGattCharacteristic? = null
     private var bridgeWatchEventChar: BluetoothGattCharacteristic? = null
+    private var bridgeNotifModeChar: BluetoothGattCharacteristic? = null
+    private var remoteIosNotifModeChar: BluetoothGattCharacteristic? = null
     private var hrMeasurementChar: BluetoothGattCharacteristic? = null
     private val subscribedCompanionDevices = ConcurrentHashMap.newKeySet<BluetoothDevice>()
     private val preparedWriteBuffers = ConcurrentHashMap<String, ByteArrayOutputStream>()
@@ -166,8 +169,13 @@ class AncsBleService : LifecycleService() {
     private val _allowDndNotifications = MutableStateFlow(true)
     val allowDndNotifications: StateFlow<Boolean> = _allowDndNotifications.asStateFlow()
 
+    private val _notificationMode = MutableStateFlow(WatchNotificationMode.NORMAL)
+    val notificationMode: StateFlow<WatchNotificationMode> = _notificationMode.asStateFlow()
     private val _isWatchMuted = MutableStateFlow(false)
     val isWatchMuted: StateFlow<Boolean> = _isWatchMuted.asStateFlow()
+    private val _cameraPrompt = MutableStateFlow<String?>(null)
+    val cameraPrompt: StateFlow<String?> = _cameraPrompt.asStateFlow()
+    @Volatile private var remoteCameraReady: Boolean = false
 
     private val _isFindingPhone = MutableStateFlow(false)
     val isFindingPhone: StateFlow<Boolean> = _isFindingPhone.asStateFlow()
@@ -185,7 +193,6 @@ class AncsBleService : LifecycleService() {
     val latestTelemetry: StateFlow<WatchTelemetrySnapshot?> = _latestTelemetry.asStateFlow()
 
     val isHfpConnected: StateFlow<Boolean> get() = hfpController.isHfpConnected
-    val isHidConnected: StateFlow<Boolean> get() = hidController.isHidConnected
     val isPanConnected: StateFlow<Boolean> get() = panController.isPanConnected
     val autoPanEnabled: StateFlow<Boolean> get() = panController.autoPanEnabled
     val networkMode: StateFlow<WatchNetworkMode> get() = panController.networkMode
@@ -258,7 +265,6 @@ class AncsBleService : LifecycleService() {
                                 updateDetectedPhoneName(d.name, null)
                                 hfpController.bindToIphone(d)
                                 panController.bindToIphone(d)
-                                hidController.bindToPhone(d)
                             }
                             activeGatt?.let { proceedToBondOrDiscover(it) }
                         }
@@ -279,7 +285,6 @@ class AncsBleService : LifecycleService() {
 
         hfpController = HfpCallController(this, bluetoothManager.adapter).also { it.initialize() }
         panController = BluetoothPanController(this, bluetoothManager.adapter).also { it.initialize() }
-        hidController = HidShutterController(this, bluetoothManager.adapter, lifecycleScope).also { it.initialize() }
         telemetryManager = TelemetrySyncManager(this, lifecycleScope).also { manager ->
             manager.setOnHeartRateUpdatedListener { syncTelemetryNow() }
             manager.setOnStepsUpdatedListener { syncTelemetryNow() }
@@ -287,7 +292,9 @@ class AncsBleService : LifecycleService() {
 
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         _allowDndNotifications.value = prefs.getBoolean(KEY_ALLOW_DND_NOTIFS, true)
-        _isWatchMuted.value = prefs.getBoolean(KEY_WATCH_MUTED, false)
+        val storedMode = WatchNotificationMode.fromWire(prefs.getString(KEY_NOTIF_MODE, null))
+            ?: WatchNotificationMode.fromLegacyMutedFlag(prefs.getBoolean(KEY_WATCH_MUTED, false))
+        applyNotificationMode(storedMode, persist = false, notifyCompanions = false)
         _blockedBundles.value = prefs.getStringSet(KEY_BLOCKED_BUNDLES, setOf("com.apple.tips")) ?: emptySet()
         prefs.getString(KEY_LAST_IPHONE_NAME, null)?.let { savedName ->
             rawGapDeviceName = savedName
@@ -379,7 +386,6 @@ class AncsBleService : LifecycleService() {
         stopBleBridge()
         hfpController.release()
         panController.release()
-        hidController.release()
         telemetryManager.release()
     }
 
@@ -400,19 +406,56 @@ class AncsBleService : LifecycleService() {
     }
 
     fun setWatchMuted(muted: Boolean) {
-        _isWatchMuted.value = muted
-        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit().putBoolean(KEY_WATCH_MUTED, muted).apply()
-        if (muted) {
-            clearAllSystemNotificationsOnly()
+        setNotificationMode(WatchNotificationMode.fromLegacyMutedFlag(muted))
+    }
+
+    fun setNotificationMode(mode: WatchNotificationMode) {
+        applyNotificationMode(mode, persist = true, notifyCompanions = true)
+    }
+
+    fun cycleNotificationMode(): WatchNotificationMode {
+        val next = when (_notificationMode.value) {
+            WatchNotificationMode.NORMAL -> WatchNotificationMode.MUTE
+            WatchNotificationMode.MUTE -> WatchNotificationMode.DND
+            WatchNotificationMode.DND -> WatchNotificationMode.NORMAL
         }
-        syncTelemetryNow()
+        setNotificationMode(next)
+        return next
     }
 
     fun toggleWatchMuted(): Boolean {
-        val next = !_isWatchMuted.value
-        setWatchMuted(next)
-        return next
+        val next = if (_notificationMode.value == WatchNotificationMode.NORMAL) {
+            WatchNotificationMode.DND
+        } else {
+            WatchNotificationMode.NORMAL
+        }
+        setNotificationMode(next)
+        return next.pausesAlerts
+    }
+
+    private fun applyNotificationMode(
+        mode: WatchNotificationMode,
+        persist: Boolean,
+        notifyCompanions: Boolean
+    ) {
+        val previous = _notificationMode.value
+        _notificationMode.value = mode
+        _isWatchMuted.value = mode.pausesAlerts
+        if (persist) {
+            getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_NOTIF_MODE, mode.wireValue)
+                .putBoolean(KEY_WATCH_MUTED, mode.blocksDelivery)
+                .apply()
+        }
+        if (mode.blocksDelivery && previous != WatchNotificationMode.DND) {
+            clearAllSystemNotificationsOnly()
+        }
+        if (notifyCompanions) {
+            notifyNotificationMode()
+            syncTelemetryNow()
+        }
+        BridgeStatusTileService.requestUpdate(this)
     }
 
     fun clearAllNotifications() {
@@ -501,6 +544,10 @@ class AncsBleService : LifecycleService() {
         remoteIosTelemetryChar = null
         remoteIosCommandChar = null
         remoteIosWatchEventChar = null
+        remoteIosNotifModeChar = null
+        remoteCameraReady = false
+        _cameraPrompt.value = null
+        _nowPlaying.value = AmsEntityParser.clearedForDisconnect()
         isConnectingOrConnected = false
         servicesDiscoveryStarted = false
         subscribedCompanionDevices.clear()
@@ -552,6 +599,10 @@ class AncsBleService : LifecycleService() {
             remoteIosTelemetryChar = null
             remoteIosCommandChar = null
             remoteIosWatchEventChar = null
+            remoteIosNotifModeChar = null
+            remoteCameraReady = false
+            _cameraPrompt.value = null
+            _nowPlaying.value = AmsEntityParser.clearedForDisconnect()
 
             if (forceCacheRefresh) refreshGattCache(gatt)
             runCatching {
@@ -760,12 +811,30 @@ class AncsBleService : LifecycleService() {
             )
         }
 
+        val notifModeChar = BluetoothGattCharacteristic(
+            AppleBleUuids.BRIDGE_NOTIF_MODE_CHAR,
+            BluetoothGattCharacteristic.PROPERTY_READ or
+                BluetoothGattCharacteristic.PROPERTY_WRITE or
+                BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE or
+                BluetoothGattCharacteristic.PROPERTY_NOTIFY,
+            BluetoothGattCharacteristic.PERMISSION_READ or BluetoothGattCharacteristic.PERMISSION_WRITE
+        ).apply {
+            addDescriptor(
+                BluetoothGattDescriptor(
+                    AppleBleUuids.CCCD,
+                    BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
+                )
+            )
+        }
+
         bridgeService.addCharacteristic(telemetryChar)
         bridgeService.addCharacteristic(commandConfigChar)
         bridgeService.addCharacteristic(watchEventChar)
+        bridgeService.addCharacteristic(notifModeChar)
 
         bridgeTelemetryChar = telemetryChar
         bridgeWatchEventChar = watchEventChar
+        bridgeNotifModeChar = notifModeChar
 
         gattServer = bluetoothManager.openGattServer(this, object : BluetoothGattServerCallback() {
             override fun onServiceAdded(status: Int, service: BluetoothGattService) {
@@ -779,7 +848,6 @@ class AncsBleService : LifecycleService() {
                     saveTargetIphoneMac(device.address)
                     updateDetectedPhoneName(device.name, null)
                     hfpController.bindToIphone(device)
-                    hidController.bindToPhone(device)
                     if (!isConnectingOrConnected && activeGatt == null) {
                         connectToIphoneGatt(device, autoConnect = false)
                     } else if (activeGatt != null && remoteIosCommandChar == null) {
@@ -813,6 +881,11 @@ class AncsBleService : LifecycleService() {
                         val slice = if (offset < hrBytes.size) hrBytes.copyOfRange(offset, hrBytes.size) else ByteArray(0)
                         gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, slice)
                     }
+                    AppleBleUuids.BRIDGE_NOTIF_MODE_CHAR -> {
+                        val payload = BridgeProtocol.encodeNotificationMode(_notificationMode.value)
+                        val slice = if (offset < payload.size) payload.copyOfRange(offset, payload.size) else ByteArray(0)
+                        gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, slice)
+                    }
                     else -> {
                         gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, ByteArray(0))
                     }
@@ -828,7 +901,14 @@ class AncsBleService : LifecycleService() {
                 offset: Int,
                 value: ByteArray?
             ) {
-                if (characteristic.uuid == AppleBleUuids.BRIDGE_COMMAND_CONFIG_CHAR && value != null) {
+                if (characteristic.uuid == AppleBleUuids.BRIDGE_NOTIF_MODE_CHAR && value != null) {
+                    subscribedCompanionDevices.add(device)
+                    _phoneContext.update { it.copy(companionConnected = true) }
+                    updateAdvertisingStateForCurrentLink()
+                    if (!preparedWrite) {
+                        BridgeProtocol.decodeNotificationMode(value)?.let { setNotificationMode(it) }
+                    }
+                } else if (characteristic.uuid == AppleBleUuids.BRIDGE_COMMAND_CONFIG_CHAR && value != null) {
                     subscribedCompanionDevices.add(device)
                     _phoneContext.update { it.copy(companionConnected = true) }
                     updateAdvertisingStateForCurrentLink()
@@ -919,8 +999,15 @@ class AncsBleService : LifecycleService() {
                 "CLEAR_NOTIFS" -> clearAllNotifications()
 
                 "SET_DND" -> {
-                    val muted = json.optBoolean("muted", false)
-                    setWatchMuted(muted)
+                    BridgeProtocol.decodeModeFromCommand(json)?.let { setNotificationMode(it) }
+                }
+
+                BridgeProtocol.CMD_SET_NOTIF_MODE -> {
+                    BridgeProtocol.decodeModeFromCommand(json)?.let { setNotificationMode(it) }
+                }
+
+                BridgeProtocol.CMD_CAMERA_STATUS -> {
+                    BridgeProtocol.decodeCameraStatus(json)?.let { handleCameraStatus(it) }
                 }
 
                 "SET_BLOCKED" -> {
@@ -935,7 +1022,7 @@ class AncsBleService : LifecycleService() {
                     val fat = if (json.has("fat") && !json.isNull("fat")) json.optDouble("fat") else null
                     val bmi = if (json.has("bmi") && !json.isNull("bmi")) json.optDouble("bmi") else null
                     val lean = if (json.has("lean") && !json.isNull("lean")) json.optDouble("lean") else null
-                    val src = json.optString("src", "Femmto").takeIf { it.isNotBlank() }
+                    val src = json.optString("src", "Apple Health").takeIf { it.isNotBlank() }
                     val mts = json.optLong("mts", System.currentTimeMillis())
 
                     telemetryManager.saveBodyCompositionFromPhone(
@@ -974,7 +1061,7 @@ class AncsBleService : LifecycleService() {
                             bodyFatPct = fat,
                             bmi = bmi,
                             leanMassKg = lean,
-                            source = json.optString("src", "Femmto"),
+                            source = json.optString("src", "Apple Health"),
                             measuredAtMillis = json.optLong("mts", System.currentTimeMillis())
                         )
                     }
@@ -1083,12 +1170,25 @@ class AncsBleService : LifecycleService() {
         }
     }
 
+    private fun notifyNotificationMode() {
+        val bytes = BridgeProtocol.encodeNotificationMode(_notificationMode.value)
+        val server = gattServer
+        val char = bridgeNotifModeChar
+        if (server != null && char != null) {
+            for (device in subscribedCompanionDevices) {
+                runCatching {
+                    server.notifyCharacteristicChanged(device, char, false, bytes)
+                }
+            }
+        }
+    }
+
     private fun notifyCompanionTelemetry(snapshot: WatchTelemetrySnapshot) {
         val bytes = telemetryManager.toBleJson(
             snapshot = snapshot,
-            isWatchMuted = _isWatchMuted.value,
+            notificationMode = _notificationMode.value,
             isHfpConnected = hfpController.isHfpConnected.value,
-            isHidConnected = hidController.isHidConnected.value,
+            isHidConnected = false,
             nowPlaying = _nowPlaying.value
         ).toByteArray(StandardCharsets.UTF_8)
 
@@ -1134,9 +1234,9 @@ class AncsBleService : LifecycleService() {
         )
         return telemetryManager.toBleJson(
             snapshot = snap,
-            isWatchMuted = _isWatchMuted.value,
+            notificationMode = _notificationMode.value,
             isHfpConnected = hfpController.isHfpConnected.value,
-            isHidConnected = hidController.isHidConnected.value,
+            isHidConnected = false,
             nowPlaying = _nowPlaying.value
         ).toByteArray(StandardCharsets.UTF_8)
     }
@@ -1359,7 +1459,6 @@ class AncsBleService : LifecycleService() {
 
                     hfpController.bindToIphone(gatt.device)
                     panController.bindToIphone(gatt.device)
-                    hidController.bindToPhone(gatt.device)
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     panController.evaluateAndArbitrateNetwork()
@@ -1392,6 +1491,7 @@ class AncsBleService : LifecycleService() {
                 remoteIosTelemetryChar = iosBridgeService.getCharacteristic(AppleBleUuids.BRIDGE_TELEMETRY_CHAR)
                 remoteIosCommandChar = iosBridgeService.getCharacteristic(AppleBleUuids.BRIDGE_COMMAND_CONFIG_CHAR)
                 remoteIosWatchEventChar = iosBridgeService.getCharacteristic(AppleBleUuids.BRIDGE_WATCH_EVENT_CHAR)
+                remoteIosNotifModeChar = iosBridgeService.getCharacteristic(AppleBleUuids.BRIDGE_NOTIF_MODE_CHAR)
 
                 remoteIosCommandChar?.let { cmdChar ->
                     enableCharacteristicNotifications(gatt, cmdChar)
@@ -1623,14 +1723,42 @@ class AncsBleService : LifecycleService() {
         _syncedIphoneTime.value = parsed.copy(systemClockUpdated = false)
     }
 
-    fun triggerCameraShutter() {
+    fun triggerRemoteCamera() {
         val vibrator = (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
         vibrator.vibrate(VibrationEffect.createOneShot(55, VibrationEffect.DEFAULT_AMPLITUDE))
+        if (remoteCameraReady) {
+            notifyCompanionWatchEvent(JSONObject(BridgeProtocol.encodeCameraEvent(capture = true)))
+        } else {
+            _cameraPrompt.value = "Abriendo la cámara en el iPhone…"
+            notifyCompanionWatchEvent(JSONObject(BridgeProtocol.encodeCameraEvent(capture = false)))
+        }
+    }
 
-        val sentViaHid = hidController.sendShutterVolumeUpPulse()
-        notifyCompanionWatchEvent(JSONObject().put("evt", "CAMERA_SHUTTER"))
-        if (!sentViaHid) {
-            sendAmsMediaCommand(AmsRemoteCommandId.VOLUME_UP)
+    private fun handleCameraStatus(status: String) {
+        when (status) {
+            BridgeProtocol.CAMERA_STATUS_READY -> {
+                remoteCameraReady = true
+                _cameraPrompt.value = "Listo. Tocá de nuevo para disparar."
+            }
+            BridgeProtocol.CAMERA_STATUS_NEED_FOREGROUND -> {
+                remoteCameraReady = false
+                _cameraPrompt.value = "Abrí la app en el iPhone"
+            }
+            BridgeProtocol.CAMERA_STATUS_DENIED -> {
+                remoteCameraReady = false
+                _cameraPrompt.value = "Permití cámara y Fotos en el iPhone"
+            }
+            BridgeProtocol.CAMERA_STATUS_CAPTURED -> {
+                remoteCameraReady = true
+                _cameraPrompt.value = "Foto guardada en el carrete"
+            }
+            BridgeProtocol.CAMERA_STATUS_SAVING -> {
+                _cameraPrompt.value = "Guardando foto…"
+            }
+            else -> {
+                remoteCameraReady = false
+                _cameraPrompt.value = "No se pudo usar la cámara"
+            }
         }
     }
 
@@ -1690,7 +1818,7 @@ class AncsBleService : LifecycleService() {
         when (header.eventId) {
             AncsEventId.ADDED, AncsEventId.MODIFIED -> {
                 if (header.isPreExisting && !header.isIncomingCall) return
-                if (_isWatchMuted.value && !header.isIncomingCall) return
+                if (_notificationMode.value.blocksDelivery) return
                 if (header.isSilent && !_allowDndNotifications.value && !header.isIncomingCall) return
 
                 if (silentFlagsByUid.size >= MAX_TRACKED_UID_METADATA) {
@@ -1731,7 +1859,7 @@ class AncsBleService : LifecycleService() {
 
     private fun handleParsedIosNotification(notification: AncsNotification) {
         if (_blockedBundles.value.contains(notification.appIdentifier) && !notification.isIncomingCall) return
-        if (_isWatchMuted.value && !notification.isIncomingCall) return
+        if (_notificationMode.value.blocksDelivery) return
 
         val bundleId = notification.appIdentifier
         if (bundleId.isNotBlank() && !AppBundleResolver.hasResolvedName(bundleId) && pendingAppNameQueries.add(bundleId)) {
@@ -1935,20 +2063,26 @@ class AncsBleService : LifecycleService() {
 
     private fun postLocalWearNotification(item: AncsNotification, forceVibrate: Boolean = false) {
         val isIncomingCall = item.isIncomingCall
-        if (_isWatchMuted.value && !forceVibrate && !isIncomingCall) {
+        val mode = _notificationMode.value
+        if (mode.blocksDelivery) {
             return
         }
 
+        val mutedDelivery = mode == WatchNotificationMode.MUTE && !forceVibrate && !isIncomingCall
         val vibrator = (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
         val isPriorityApp = _priorityBundles.value.contains(item.appIdentifier)
 
-        when {
-            isIncomingCall -> {
-                activeCallUid = item.uid
-                vibrator.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 500, 300, 500, 600), 0))
+        if (!mutedDelivery) {
+            when {
+                isIncomingCall -> {
+                    activeCallUid = item.uid
+                    vibrator.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 500, 300, 500, 600), 0))
+                }
+                isPriorityApp -> vibrator.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 220, 120, 280), -1))
+                else -> vibrator.vibrate(VibrationEffect.createOneShot(160, VibrationEffect.DEFAULT_AMPLITUDE))
             }
-            isPriorityApp -> vibrator.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 220, 120, 280), -1))
-            else -> vibrator.vibrate(VibrationEffect.createOneShot(160, VibrationEffect.DEFAULT_AMPLITUDE))
+        } else if (isIncomingCall) {
+            activeCallUid = item.uid
         }
 
         val bodyText = buildString {
@@ -1976,7 +2110,11 @@ class AncsBleService : LifecycleService() {
             item.uid, BlePassiveScanReceiver.OP_NEGATIVE, 3
         )
 
-        val channelId = if (isIncomingCall) CALLS_CHANNEL_ID else ALERTS_CHANNEL_ID
+        val channelId = when {
+            isIncomingCall -> CALLS_CHANNEL_ID
+            mutedDelivery -> SILENT_ALERTS_CHANNEL_ID
+            else -> ALERTS_CHANNEL_ID
+        }
 
         val builder = Notification.Builder(this, channelId)
             .setSmallIcon(if (isIncomingCall) android.R.drawable.sym_call_incoming else android.R.drawable.sym_action_chat)
@@ -2070,6 +2208,17 @@ class AncsBleService : LifecycleService() {
         notificationManager.createNotificationChannel(
             NotificationChannel(ALERTS_CHANNEL_ID, "Mensajes del iPhone", NotificationManager.IMPORTANCE_HIGH)
         )
+        val silentAlerts = NotificationChannel(
+            SILENT_ALERTS_CHANNEL_ID,
+            "Mensajes del iPhone (silencio)",
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            setSound(null, null)
+            enableVibration(false)
+            enableLights(false)
+            setShowBadge(true)
+        }
+        notificationManager.createNotificationChannel(silentAlerts)
         notificationManager.createNotificationChannel(
             NotificationChannel(CALLS_CHANNEL_ID, "Llamadas Entrantes", NotificationManager.IMPORTANCE_HIGH)
         )

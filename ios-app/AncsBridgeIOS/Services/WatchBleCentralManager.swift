@@ -24,6 +24,7 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
     @Published private(set) var recentNotifications: [WatchNotificationLogItem] = []
     @Published private(set) var blockedBundles: Set<String> = []
     @Published private(set) var discoveredApps: [IosAppFilterCatalogItem] = IosAppFilterCatalogItem.defaultCatalog
+    @Published private(set) var notificationMode: WatchNotificationMode = .normal
 
     var isConnected: Bool { linkState.isReady }
 
@@ -33,12 +34,14 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
     private var telemetryChar: CBCharacteristic?
     private var commandChar: CBCharacteristic?
     private var eventChar: CBCharacteristic?
+    private var notifModeChar: CBCharacteristic?
 
     // MARK: - Peripheral Server Role Internals (Fast-Link sobre activeGatt del reloj)
     private var peripheralManager: CBPeripheralManager!
     private var localCommandChar: CBMutableCharacteristic?
     private var localTelemetryChar: CBMutableCharacteristic?
     private var localEventChar: CBMutableCharacteristic?
+    private var localNotifModeChar: CBMutableCharacteristic?
     private var isLocalServicePublished = false
     private var hasSubscribedWatchCentral = false
     private var pendingPeripheralUpdates: [Data] = []
@@ -212,6 +215,7 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
         telemetryChar = nil
         commandChar = nil
         eventChar = nil
+        notifModeChar = nil
     }
 
     private func scheduleRetry(after seconds: Double, _ block: @escaping @MainActor () -> Void) {
@@ -273,13 +277,20 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
                 value: nil,
                 permissions: [.readable, .writeable]
             )
+            let modeChar = CBMutableCharacteristic(
+                type: BridgeBleUUIDs.notifModeChar,
+                properties: [.read, .write, .writeWithoutResponse, .notify],
+                value: nil,
+                permissions: [.readable, .writeable]
+            )
 
             let service = CBMutableService(type: BridgeBleUUIDs.bridgeService, primary: true)
-            service.characteristics = [telChar, cmdChar, evtChar]
+            service.characteristics = [telChar, cmdChar, evtChar, modeChar]
 
             localTelemetryChar = telChar
             localCommandChar = cmdChar
             localEventChar = evtChar
+            localNotifModeChar = modeChar
 
             peripheralManager.removeAllServices()
             peripheralManager.add(service)
@@ -378,8 +389,29 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
     }
 
     func setWatchMuted(_ muted: Bool) {
-        telemetry.dnd = muted
-        sendJson(["cmd": "SET_DND", "muted": muted])
+        setNotificationMode(muted ? .dnd : .normal)
+    }
+
+    func setNotificationMode(_ mode: WatchNotificationMode) {
+        notificationMode = mode
+        telemetry.dnd = (mode == .dnd)
+        telemetry.notifMode = mode.rawValue
+        if let p = peripheral, p.state == .connected, let c = notifModeChar {
+            let writeType: CBCharacteristicWriteType = c.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
+            p.writeValue(mode.payload, for: c, type: writeType)
+        }
+        sendJson(["v": 2, "cmd": "SET_NOTIF_MODE", "mode": mode.rawValue])
+    }
+
+    func sendCameraStatus(_ status: String) {
+        sendJson(["v": 2, "cmd": "CAMERA_STATUS", "status": status])
+    }
+
+    private func applyNotificationModeFromWatch(_ data: Data) {
+        guard let mode = WatchNotificationMode.decode(data) else { return }
+        notificationMode = mode
+        telemetry.dnd = (mode == .dnd)
+        telemetry.notifMode = mode.rawValue
     }
 
     func sendMediaCommand(_ action: String) {
@@ -411,7 +443,11 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
 
     @discardableResult
     private func sendJson(_ dict: [String: Any]) -> Bool {
-        guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return false }
+        var payload = dict
+        if payload["v"] == nil {
+            payload["v"] = 2
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return false }
         var sent = false
 
         // Vía 1: Escritura como Central hacia el servidor GATT del reloj
@@ -481,6 +517,7 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
             onLinkReady()
         }
         telemetry = decoded
+        notificationMode = decoded.resolvedNotificationMode
         lastTelemetryDate = Date()
         isSyncing = false
         if !decoded.model.isEmpty {
@@ -508,6 +545,14 @@ final class WatchBleCentralManager: NSObject, ObservableObject {
             } else {
                 PhoneFindMyAlarmManager.shared.stopAlarm()
             }
+
+        case "CAMERA_OPEN":
+            let status = RemoteCameraController.shared.handleWatchOpenRequest()
+            sendCameraStatus(status)
+
+        case "CAMERA_CAPTURE":
+            let status = RemoteCameraController.shared.handleWatchCaptureRequest()
+            sendCameraStatus(status)
 
         case "WATCH_FOUND":
             ringWatchTimeoutTask?.cancel()
@@ -660,7 +705,8 @@ extension WatchBleCentralManager: CBPeripheralDelegate {
                 peripheral.discoverCharacteristics([
                     BridgeBleUUIDs.telemetryChar,
                     BridgeBleUUIDs.commandConfigChar,
-                    BridgeBleUUIDs.watchEventChar
+                    BridgeBleUUIDs.watchEventChar,
+                    BridgeBleUUIDs.notifModeChar
                 ], for: service)
                 return
             }
@@ -699,6 +745,12 @@ extension WatchBleCentralManager: CBPeripheralDelegate {
                 case BridgeBleUUIDs.watchEventChar:
                     eventChar = c
                     peripheral.setNotifyValue(true, for: c)
+                case BridgeBleUUIDs.notifModeChar:
+                    notifModeChar = c
+                    peripheral.setNotifyValue(true, for: c)
+                    if let data = c.value, !data.isEmpty {
+                        applyNotificationModeFromWatch(data)
+                    }
                 default:
                     break
                 }
@@ -717,6 +769,8 @@ extension WatchBleCentralManager: CBPeripheralDelegate {
                 handleTelemetry(data)
             case BridgeBleUUIDs.watchEventChar:
                 handleWatchEvent(data)
+            case BridgeBleUUIDs.notifModeChar:
+                applyNotificationModeFromWatch(data)
             default:
                 break
             }
@@ -835,6 +889,8 @@ extension WatchBleCentralManager: CBPeripheralManagerDelegate {
                         handleTelemetry(val)
                     case BridgeBleUUIDs.watchEventChar:
                         handleWatchEvent(val)
+                    case BridgeBleUUIDs.notifModeChar:
+                        applyNotificationModeFromWatch(val)
                     default:
                         break
                     }

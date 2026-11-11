@@ -9,8 +9,43 @@ enum BridgeBleUUIDs {
     static let telemetryChar = CBUUID(string: "D973F2E1-B19E-11E2-9E96-0800200C9A66")
     static let commandConfigChar = CBUUID(string: "D973F2E2-B19E-11E2-9E96-0800200C9A66")
     static let watchEventChar = CBUUID(string: "D973F2E3-B19E-11E2-9E96-0800200C9A66")
+    static let notifModeChar = CBUUID(string: "D973F2E4-B19E-11E2-9E96-0800200C9A66")
 
     static let genericHeartRateService = CBUUID(string: "180D")
+}
+
+enum WatchNotificationMode: String, CaseIterable, Equatable {
+    case normal
+    case mute
+    case dnd
+
+    var title: String {
+        switch self {
+        case .normal: return "Normal"
+        case .mute: return "Silencio"
+        case .dnd: return "No molestar"
+        }
+    }
+
+    var payload: Data {
+        let obj: [String: Any] = ["v": 2, "mode": rawValue]
+        return (try? JSONSerialization.data(withJSONObject: obj)) ?? Data(rawValue.utf8)
+    }
+
+    static func decode(_ data: Data) -> WatchNotificationMode? {
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let mode = json["mode"] as? String, let parsed = WatchNotificationMode(rawValue: mode) {
+                return parsed
+            }
+            if let muted = json["muted"] as? Bool {
+                return muted ? .dnd : .normal
+            }
+        }
+        if let raw = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
+            return WatchNotificationMode(rawValue: raw)
+        }
+        return nil
+    }
 }
 
 // MARK: - Resolución Dinámica de Hardware (Cero Nombres Hardcodeados)
@@ -98,19 +133,21 @@ struct WatchTelemetryPayload: Decodable, Equatable {
     var steps: Int = 0
     var hr: Int = 0
     var dnd: Bool = false
+    var notifMode: String? = nil
     var hfp: Bool = false
     var hid: Bool = false
     var model: String = ""
-    var mTitle: String = "Sin reproducción"
-    var mArtist: String = "Control multimedia"
+    var mTitle: String = ""
+    var mArtist: String = ""
     var mPlay: Bool = false
+    var mIdle: Bool = true
     var mVol: Int? = nil
     var ts: Int64 = 0
 
     init() {}
 
     enum CodingKeys: String, CodingKey {
-        case bat, chg, steps, hr, dnd, hfp, hid, model, mTitle, mArtist, mPlay, mVol, ts
+        case bat, chg, steps, hr, dnd, notifMode, hfp, hid, model, mTitle, mArtist, mPlay, mIdle, mVol, ts
     }
 
     init(from decoder: Decoder) throws {
@@ -120,20 +157,31 @@ struct WatchTelemetryPayload: Decodable, Equatable {
         steps = (try? c.decodeIfPresent(Int.self, forKey: .steps)) ?? 0
         hr = (try? c.decodeIfPresent(Int.self, forKey: .hr)) ?? 0
         dnd = (try? c.decodeIfPresent(Bool.self, forKey: .dnd)) ?? false
+        notifMode = try? c.decodeIfPresent(String.self, forKey: .notifMode)
         hfp = (try? c.decodeIfPresent(Bool.self, forKey: .hfp)) ?? false
         hid = (try? c.decodeIfPresent(Bool.self, forKey: .hid)) ?? false
         model = (try? c.decodeIfPresent(String.self, forKey: .model)) ?? ""
-        mTitle = (try? c.decodeIfPresent(String.self, forKey: .mTitle)) ?? "Sin reproducción"
-        mArtist = (try? c.decodeIfPresent(String.self, forKey: .mArtist)) ?? "Control multimedia"
+        mTitle = (try? c.decodeIfPresent(String.self, forKey: .mTitle)) ?? ""
+        mArtist = (try? c.decodeIfPresent(String.self, forKey: .mArtist)) ?? ""
         mPlay = (try? c.decodeIfPresent(Bool.self, forKey: .mPlay)) ?? false
+        mIdle = (try? c.decodeIfPresent(Bool.self, forKey: .mIdle)) ?? !mPlay
         mVol = try? c.decodeIfPresent(Int.self, forKey: .mVol)
         ts = (try? c.decodeIfPresent(Int64.self, forKey: .ts)) ?? 0
     }
 
     var hasData: Bool { ts > 0 }
+
+    var resolvedNotificationMode: WatchNotificationMode {
+        if let notifMode, let parsed = WatchNotificationMode(rawValue: notifMode) {
+            return parsed
+        }
+        return dnd ? .dnd : .normal
+    }
+
+    var isMediaIdle: Bool { mIdle || !mPlay }
 }
 
-// MARK: - Composición corporal (Apple Salud ← balanza Femmto)
+// MARK: - Composición corporal (Apple Health)
 
 struct BodyComposition: Equatable {
     var weightKg: Double?

@@ -40,7 +40,14 @@ class BridgeStatusTileService : TileService() {
         val phoneName = blePrefs.getString("last_iphone_real_name", "iPhone") ?: "iPhone"
         val connLabel = blePrefs.getString("last_conn_state_label", "Conectado") ?: "Conectado"
         val phoneBatt = blePrefs.getInt("last_iphone_battery", -1)
-        val isMuted = blePrefs.getBoolean("watch_notifications_muted", false)
+        val notifMode = blePrefs.getString("watch_notification_mode", null)
+        val isMuted = notifMode == "mute" || notifMode == "dnd" ||
+            blePrefs.getBoolean("watch_notifications_muted", false)
+        val modeLine = when (notifMode) {
+            "mute" -> "🔕 Silencio"
+            "dnd" -> "🚫 No molestar"
+            else -> if (isMuted) "🚫 No molestar" else "🔔 Notificaciones activas"
+        }
 
         val steps = telPrefs.getLong("last_steps", 0L)
         val hrBpm = telPrefs.getLong("last_hr_bpm", 0L)
@@ -63,13 +70,13 @@ class BridgeStatusTileService : TileService() {
 
         val batteryText = if (phoneBatt in 0..100) "$connLabel • 🔋 $phoneBatt%" else connLabel
         val hrText = if (hrBpm > 0) "❤️ $hrBpm BPM" else "❤️ --"
-        val femmtoLine = buildString {
+        val healthLine = buildString {
             if (weightKg > 0f) append(String.format(Locale.US, "⚖️ %.1f kg", weightKg))
             if (fatPct > 0f) {
                 if (isNotEmpty()) append(" • ")
                 append(String.format(Locale.US, "%.1f%% grasa", fatPct))
             }
-        }.ifEmpty { if (isMuted) "🔕 Notificaciones pausadas" else "🔔 Notificaciones activas" }
+        }.ifEmpty { modeLine }
 
         val rootLayout = LayoutElementBuilders.Box.Builder()
             .setWidth(expand())
@@ -128,7 +135,7 @@ class BridgeStatusTileService : TileService() {
                     .addContent(LayoutElementBuilders.Spacer.Builder().setHeight(dp(6f)).build())
                     .addContent(
                         LayoutElementBuilders.Text.Builder()
-                            .setText(femmtoLine)
+                            .setText(healthLine)
                             .setFontStyle(
                                 LayoutElementBuilders.FontStyle.Builder()
                                     .setSize(sp(11f))

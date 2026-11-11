@@ -134,7 +134,7 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
     val focusRequester = remember { FocusRequester() }
     val timeFormatter = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
 
-    // 3 páginas: 0 = Notificaciones | 1 = Control Principal (por defecto) | 2 = Salud y Femmto
+    // 3 páginas: 0 = Notificaciones | 1 = Control Principal (por defecto) | 2 = Salud
     val pagerState = rememberPagerState(initialPage = 1, pageCount = { 3 })
     val notifListState = rememberScalingLazyListState()
     val controlListState = rememberScalingLazyListState()
@@ -154,8 +154,10 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
         ?: remember { mutableStateOf(null) }
     val notifications by service?.notifications?.collectAsState()
         ?: remember { mutableStateOf(emptyList()) }
-    val isWatchMuted by service?.isWatchMuted?.collectAsState()
-        ?: remember { mutableStateOf(false) }
+    val notificationMode by service?.notificationMode?.collectAsState()
+        ?: remember { mutableStateOf(WatchNotificationMode.NORMAL) }
+    val cameraPrompt by service?.cameraPrompt?.collectAsState()
+        ?: remember { mutableStateOf(null) }
     val isMeasuringHr by service?.isMeasuringHr?.collectAsState()
         ?: remember { mutableStateOf(false) }
     val isFindingPhone by service?.isFindingPhone?.collectAsState()
@@ -230,9 +232,13 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
                                     color = Color.White
                                 )
                                 Text(
-                                    text = if (isWatchMuted) "🔕 Alertas pausadas en reloj" else "🔔 Alertas activas",
+                                    text = when (notificationMode) {
+                                        WatchNotificationMode.MUTE -> "🔕 Silencio: llegan sin sonido"
+                                        WatchNotificationMode.DND -> "🚫 No molestar: no llegan"
+                                        else -> "🔔 Alertas activas"
+                                    },
                                     fontSize = 10.sp,
-                                    color = if (isWatchMuted) AccentCoral else AccentEmerald
+                                    color = if (notificationMode == WatchNotificationMode.NORMAL) AccentEmerald else AccentCoral
                                 )
                             }
                         }
@@ -242,21 +248,11 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
                                 modifier = Modifier.fillMaxWidth(0.9f),
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
-                                Button(
-                                    onClick = { service?.toggleWatchMuted() },
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .height(34.dp),
-                                    colors = ButtonDefaults.buttonColors(
-                                        backgroundColor = if (isWatchMuted) Color(0xFF4C1D24) else Color(0xFF12352B)
-                                    )
-                                ) {
-                                    Text(
-                                        text = if (isWatchMuted) "Activar" else "Silenciar",
-                                        fontSize = 10.sp,
-                                        color = if (isWatchMuted) Color(0xFFFDA4AF) else Color(0xFF6EE7B7)
-                                    )
-                                }
+                                NotificationModeChips(
+                                    mode = notificationMode,
+                                    onSelect = { service?.setNotificationMode(it) },
+                                    modifier = Modifier.weight(1f)
+                                )
                                 if (notifications.isNotEmpty()) {
                                     Button(
                                         onClick = { service?.clearAllNotifications() },
@@ -280,17 +276,24 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
                                     horizontalAlignment = Alignment.CenterHorizontally
                                 ) {
                                     Text(
-                                        text = if (isWatchMuted) "Notificaciones en pausa" else "Todo al día",
+                                        text = when (notificationMode) {
+                                            WatchNotificationMode.DND -> "No molestar"
+                                            WatchNotificationMode.MUTE -> "En silencio"
+                                            else -> "Todo al día"
+                                        },
                                         fontSize = 12.sp,
                                         fontWeight = FontWeight.SemiBold,
                                         color = Color.White
                                     )
                                     Spacer(modifier = Modifier.height(4.dp))
                                     Text(
-                                        text = if (isWatchMuted) {
-                                            "No saldrán mensajes ni el punto naranja hasta que las actives."
-                                        } else {
-                                            "Los mensajes de $phoneName aparecerán aquí."
+                                        text = when (notificationMode) {
+                                            WatchNotificationMode.DND ->
+                                                "No se postean mensajes del iPhone hasta que lo desactives."
+                                            WatchNotificationMode.MUTE ->
+                                                "Los mensajes llegan a la bandeja, sin sonido ni vibración."
+                                            else ->
+                                                "Los mensajes de $phoneName aparecerán aquí."
                                         },
                                         fontSize = 10.sp,
                                         color = TextSecondary,
@@ -480,34 +483,18 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
                             }
                         }
 
-                        // 3. Botón Maestro para Silenciar / Pausar Notificaciones en el Reloj
+                        // Acciones rápidas: Cámara in-app en el iPhone • Buscar iPhone
                         item {
-                            Button(
-                                onClick = { service?.toggleWatchMuted() },
-                                modifier = Modifier
-                                    .fillMaxWidth(0.92f)
-                                    .height(40.dp),
-                                colors = ButtonDefaults.buttonColors(
-                                    backgroundColor = if (isWatchMuted) Color(0xFF4C1D24) else Color(0xFF112E28)
-                                )
-                            ) {
-                                Text(
-                                    text = if (isWatchMuted) "🔕 Notif. Silenciadas (Tocar)" else "🔔 Notificaciones Activas",
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = if (isWatchMuted) Color(0xFFFDA4AF) else Color(0xFF6EE7B7)
-                                )
-                            }
-                        }
-
-                        // 4. Acciones Rápidas: Cámara • Buscar iPhone (con parada directa desde el reloj)
-                        item {
-                            Row(
+                            Column(
                                 modifier = Modifier.fillMaxWidth(0.92f),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
                                 Button(
-                                    onClick = { service?.triggerCameraShutter() },
+                                    onClick = { service?.triggerRemoteCamera() },
                                     modifier = Modifier
                                         .weight(1f)
                                         .height(36.dp),
@@ -531,9 +518,19 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
                                     )
                                 }
                             }
+                            cameraPrompt?.let { prompt ->
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = prompt,
+                                    fontSize = 9.sp,
+                                    color = AccentAmber,
+                                    textAlign = TextAlign.Center
+                                )
+                            }
+                            }
                         }
 
-                        // 5. Reproductor Multimedia AMS + App + Volumen en vivo
+                        // Reproductor Multimedia AMS
                         item {
                             Column(
                                 modifier = Modifier
@@ -544,90 +541,120 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
                                     .padding(vertical = 10.dp, horizontal = 12.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally
                             ) {
-                                if (nowPlaying.playerName.isNotBlank() || nowPlaying.volumePercent != null) {
-                                    val playerBadge = buildString {
-                                        if (nowPlaying.playerName.isNotBlank()) append(nowPlaying.playerName)
-                                        nowPlaying.volumePercent?.let {
-                                            if (isNotEmpty()) append(" • ")
-                                            append("🔊 $it%")
-                                        }
-                                    }
+                                if (nowPlaying.isIdle) {
                                     Text(
-                                        text = playerBadge,
-                                        fontSize = 9.sp,
-                                        color = AccentCyan,
-                                        maxLines = 1
+                                        text = "Nada sonando en este iPhone",
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White,
+                                        textAlign = TextAlign.Center
                                     )
-                                    Spacer(modifier = Modifier.height(2.dp))
-                                }
-                                Text(
-                                    text = nowPlaying.title,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color.White,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                val subtitleLine = if (nowPlaying.album.isNotBlank()) {
-                                    "${nowPlaying.artist} • ${nowPlaying.album}"
-                                } else {
-                                    nowPlaying.artist
-                                }
-                                Text(
-                                    text = subtitleLine,
-                                    fontSize = 10.sp,
-                                    color = TextSecondary,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceEvenly,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    CompactButton(
-                                        onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.PREVIOUS_TRACK) },
-                                        colors = ButtonDefaults.secondaryButtonColors(backgroundColor = Color(0xFF20222C))
-                                    ) {
-                                        Text("⏮", fontSize = 14.sp, color = AccentCyan)
-                                    }
-                                    Button(
-                                        onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.TOGGLE_PLAY_PAUSE) },
-                                        modifier = Modifier.size(42.dp),
-                                        colors = ButtonDefaults.primaryButtonColors(
-                                            backgroundColor = if (nowPlaying.isPlaying) AccentEmerald else AccentCyan
+                                    val lastLine = listOf(nowPlaying.lastTitle, nowPlaying.lastArtist)
+                                        .filter { it.isNotBlank() }
+                                        .joinToString(" — ")
+                                    if (lastLine.isNotBlank()) {
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            text = "Último: $lastLine",
+                                            fontSize = 9.sp,
+                                            color = TextSecondary,
+                                            maxLines = 2,
+                                            textAlign = TextAlign.Center
                                         )
+                                    }
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Button(
+                                        onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.PLAY) },
+                                        modifier = Modifier.fillMaxWidth(),
+                                        colors = ButtonDefaults.primaryButtonColors(backgroundColor = AccentCyan)
                                     ) {
                                         Text(
-                                            if (nowPlaying.isPlaying) "⏸" else "▶",
-                                            fontSize = 16.sp,
+                                            "Reproducir en el iPhone",
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.SemiBold,
                                             color = Color.Black
                                         )
                                     }
-                                    CompactButton(
-                                        onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.NEXT_TRACK) },
-                                        colors = ButtonDefaults.secondaryButtonColors(backgroundColor = Color(0xFF20222C))
-                                    ) {
-                                        Text("⏭", fontSize = 14.sp, color = AccentCyan)
+                                } else {
+                                    if (nowPlaying.playerName.isNotBlank() || nowPlaying.volumePercent != null) {
+                                        val playerBadge = buildString {
+                                            if (nowPlaying.playerName.isNotBlank()) append(nowPlaying.playerName)
+                                            nowPlaying.volumePercent?.let {
+                                                if (isNotEmpty()) append(" • ")
+                                                append("🔊 $it%")
+                                            }
+                                        }
+                                        Text(
+                                            text = playerBadge,
+                                            fontSize = 9.sp,
+                                            color = AccentCyan,
+                                            maxLines = 1
+                                        )
+                                        Spacer(modifier = Modifier.height(2.dp))
                                     }
-                                }
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(0.84f),
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    CompactButton(
-                                        onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.VOLUME_DOWN) },
-                                        colors = ButtonDefaults.secondaryButtonColors(backgroundColor = Color(0xFF1C1E27))
-                                    ) {
-                                        Text("🔉-", fontSize = 10.sp, color = TextSecondary)
+                                    Text(
+                                        text = nowPlaying.title.ifBlank { "Reproduciendo" },
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    val subtitleLine = if (nowPlaying.album.isNotBlank()) {
+                                        "${nowPlaying.artist} • ${nowPlaying.album}"
+                                    } else {
+                                        nowPlaying.artist
                                     }
-                                    CompactButton(
-                                        onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.VOLUME_UP) },
-                                        colors = ButtonDefaults.secondaryButtonColors(backgroundColor = Color(0xFF1C1E27))
+                                    Text(
+                                        text = subtitleLine,
+                                        fontSize = 10.sp,
+                                        color = TextSecondary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceEvenly,
+                                        verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Text("🔊+", fontSize = 10.sp, color = TextSecondary)
+                                        CompactButton(
+                                            onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.PREVIOUS_TRACK) },
+                                            colors = ButtonDefaults.secondaryButtonColors(backgroundColor = Color(0xFF20222C))
+                                        ) {
+                                            Text("⏮", fontSize = 14.sp, color = AccentCyan)
+                                        }
+                                        Button(
+                                            onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.PAUSE) },
+                                            modifier = Modifier.size(42.dp),
+                                            colors = ButtonDefaults.primaryButtonColors(backgroundColor = AccentEmerald)
+                                        ) {
+                                            Text("⏸", fontSize = 16.sp, color = Color.Black)
+                                        }
+                                        CompactButton(
+                                            onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.NEXT_TRACK) },
+                                            colors = ButtonDefaults.secondaryButtonColors(backgroundColor = Color(0xFF20222C))
+                                        ) {
+                                            Text("⏭", fontSize = 14.sp, color = AccentCyan)
+                                        }
+                                    }
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(0.84f),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        CompactButton(
+                                            onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.VOLUME_DOWN) },
+                                            colors = ButtonDefaults.secondaryButtonColors(backgroundColor = Color(0xFF1C1E27))
+                                        ) {
+                                            Text("🔉-", fontSize = 10.sp, color = TextSecondary)
+                                        }
+                                        CompactButton(
+                                            onClick = { service?.sendAmsMediaCommand(AmsRemoteCommandId.VOLUME_UP) },
+                                            colors = ButtonDefaults.secondaryButtonColors(backgroundColor = Color(0xFF1C1E27))
+                                        ) {
+                                            Text("🔊+", fontSize = 10.sp, color = TextSecondary)
+                                        }
                                     }
                                 }
                             }
@@ -635,7 +662,7 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
 
                         item {
                             Text(
-                                text = "⬅ Mensajes (${notifications.size})  •  Salud y Femmto ➡",
+                                text = "⬅ Mensajes (${notifications.size})  •  Salud ➡",
                                 fontSize = 9.sp,
                                 color = TextSecondary,
                                 modifier = Modifier.padding(bottom = 14.dp)
@@ -654,7 +681,7 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
                     ) {
                         item {
                             Text(
-                                text = "Salud y Femmto",
+                                text = "Salud",
                                 fontSize = 13.sp,
                                 fontWeight = FontWeight.Bold,
                                 color = Color.White,
@@ -728,7 +755,7 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
                             }
                         }
 
-                        // 2. Tarjeta Dedicada: Balanza Inteligente Femmto (Sincronizada desde el iPhone)
+                        // 2. Tarjeta de composición corporal (Apple Health)
                         item {
                             val weightStr = telemetry?.weightKg?.let { String.format(Locale.US, "%.1f kg", it) } ?: "-- kg"
                             val fatStr = telemetry?.bodyFatPercentage?.let { String.format(Locale.US, "%.1f%%", it) } ?: "--%"
@@ -746,7 +773,7 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
                                 horizontalAlignment = Alignment.CenterHorizontally
                             ) {
                                 Text(
-                                    text = "⚖️ Balanza ${telemetry?.bodyCompSource ?: "Femmto"}",
+                                    text = "⚖️ ${telemetry?.bodyCompSource ?: "Apple Health"}",
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = AccentCyan
@@ -785,7 +812,7 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
                                 } else if (telemetry?.weightKg == null) {
                                     Spacer(modifier = Modifier.height(4.dp))
                                     Text(
-                                        text = "Sincronizá desde la app Watch Bridge en $phoneName",
+                                        text = "Sincronizá Apple Health desde Watch Bridge en $phoneName",
                                         fontSize = 9.sp,
                                         color = TextSecondary,
                                         textAlign = TextAlign.Center
@@ -943,6 +970,49 @@ fun WatchBridgePagerApp(service: AncsBleService?) {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun NotificationModeChips(
+    mode: WatchNotificationMode,
+    onSelect: (WatchNotificationMode) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        WatchNotificationMode.entries.forEach { option ->
+            val selected = option == mode
+            Button(
+                onClick = { onSelect(option) },
+                modifier = Modifier
+                    .weight(1f)
+                    .height(34.dp),
+                colors = ButtonDefaults.buttonColors(
+                    backgroundColor = if (selected) {
+                        if (option == WatchNotificationMode.NORMAL) Color(0xFF12352B) else Color(0xFF4C1D24)
+                    } else {
+                        Color(0xFF20222C)
+                    }
+                )
+            ) {
+                Text(
+                    text = when (option) {
+                        WatchNotificationMode.NORMAL -> "On"
+                        WatchNotificationMode.MUTE -> "Sil"
+                        WatchNotificationMode.DND -> "DND"
+                    },
+                    fontSize = 9.sp,
+                    color = if (selected) {
+                        if (option == WatchNotificationMode.NORMAL) Color(0xFF6EE7B7) else Color(0xFFFDA4AF)
+                    } else {
+                        Color(0xFFA1A1AA)
+                    }
+                )
             }
         }
     }

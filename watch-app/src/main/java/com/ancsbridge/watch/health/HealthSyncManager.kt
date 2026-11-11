@@ -80,6 +80,7 @@ class HardwareSensorMonitor(
         val hrSensor = sm.getDefaultSensor(Sensor.TYPE_HEART_RATE) ?: return
 
         burstFirstSampleDelivered = false
+        lastHrNotifyMillis = 0L
         _isMeasuringHr.value = true
         runCatching {
             sm.unregisterListener(this, hrSensor)
@@ -136,14 +137,24 @@ class HardwareSensorMonitor(
             }
 
             Sensor.TYPE_HEART_RATE -> {
+                val accuracy = ev.accuracy
+                if (accuracy == SensorManager.SENSOR_STATUS_UNRELIABLE ||
+                    accuracy == SensorManager.SENSOR_STATUS_NO_CONTACT
+                ) {
+                    return
+                }
                 val bpm = ev.values.firstOrNull()?.toLong() ?: return
                 if (bpm in 30L..240L) {
+                    // La primera muestra válida de cada ráfaga suele ser un calentamiento del PPG.
+                    if (!burstFirstSampleDelivered) {
+                        burstFirstSampleDelivered = true
+                        return
+                    }
                     latestHeartRateBpm = bpm
                     prefs.edit().putLong(KEY_CACHED_HR_BPM, bpm).apply()
 
                     val now = System.currentTimeMillis()
-                    if (!burstFirstSampleDelivered || now - lastHrNotifyMillis >= HR_PUSH_THROTTLE_MS) {
-                        burstFirstSampleDelivered = true
+                    if (lastHrNotifyMillis == 0L || now - lastHrNotifyMillis >= HR_PUSH_THROTTLE_MS) {
                         lastHrNotifyMillis = now
                         onHeartRateUpdated?.invoke(bpm)
                     }

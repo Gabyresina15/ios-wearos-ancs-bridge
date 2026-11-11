@@ -1,11 +1,7 @@
 import Foundation
 import HealthKit
 
-/// Gestor unificado de Salud (Apple HealthKit + Balanza Inteligente Femmto):
-///  • Lee automáticamente Peso, % Grasa Corporal, IMC y Masa Magra de Apple Salud (escritos por la app Femmto).
-///  • Permite registrar o actualizar tu pesada de Femmto directamente en la app o vía URL Scheme (`watchbridge://femmto?wt=...&fat=...`)
-///    para funcionar al 100% incluso cuando Sideloadly firma con cuenta gratuita de Apple.
-///  • Escribe en Apple Salud los pasos y la frecuencia cardíaca medidos por el Galaxy Watch 6 Classic.
+/// Gestor de Apple Health: lee composición corporal y escribe pasos/pulso del reloj.
 @MainActor
 final class HealthKitSyncManager: ObservableObject {
     static let shared = HealthKitSyncManager()
@@ -17,7 +13,7 @@ final class HealthKitSyncManager: ObservableObject {
     @Published var userHeightCm: Double = 175.0
     @Published var dailyStepGoal: Int = 8000
 
-    /// Se dispara cada vez que cambia la composición corporal de Femmto para enviarla al reloj por BLE.
+    /// Se dispara cada vez que cambia la composición corporal para enviarla al reloj por BLE.
     var onBodyCompositionChanged: ((BodyComposition) -> Void)?
 
     private let healthStore = HKHealthStore()
@@ -55,7 +51,7 @@ final class HealthKitSyncManager: ObservableObject {
         if savedGoal >= 1000 {
             dailyStepGoal = savedGoal
         }
-        loadCachedFemmtoComposition()
+        loadCachedBodyComposition()
     }
 
     func updateStepGoal(_ newGoal: Int) {
@@ -64,15 +60,15 @@ final class HealthKitSyncManager: ObservableObject {
         defaults.set(clamped, forKey: Keys.stepGoal)
     }
 
-    // MARK: - Caché Local y Actualización Directa de Balanza Femmto
+    // MARK: - Caché local y actualización de composición corporal
 
-    private func loadCachedFemmtoComposition() {
+    private func loadCachedBodyComposition() {
         let w = defaults.double(forKey: Keys.cachedWeightKg)
         let f = defaults.double(forKey: Keys.cachedFatPct)
         let b = defaults.double(forKey: Keys.cachedBmi)
         let l = defaults.double(forKey: Keys.cachedLeanKg)
         let ts = defaults.double(forKey: Keys.cachedMeasuredTs)
-        let src = defaults.string(forKey: Keys.cachedSource) ?? "Femmto"
+        let src = defaults.string(forKey: Keys.cachedSource) ?? "Apple Health"
 
         var comp = BodyComposition()
         if w > 15.0 { comp.weightKg = w }
@@ -93,13 +89,12 @@ final class HealthKitSyncManager: ObservableObject {
         if let s = comp.sourceName { defaults.set(s, forKey: Keys.cachedSource) }
     }
 
-    /// Registra o actualiza los datos de tu balanza inteligente Femmto, calcula IMC y Masa Magra
-    /// automáticamente y los envía en tiempo real al Galaxy Watch 6 Classic.
-    func saveFemmtoMeasurement(
+    /// Registra una medición de composición corporal, calcula IMC y masa magra, y la envía al reloj.
+    func saveBodyMeasurement(
         weightKg: Double,
         bodyFatPercent: Double?,
         heightCm: Double?,
-        source: String = "Femmto"
+        source: String = "Apple Health"
     ) {
         guard weightKg > 15.0 && weightKg < 300.0 else { return }
         if let h = heightCm, h >= 100.0 && h <= 240.0 {
@@ -143,7 +138,7 @@ final class HealthKitSyncManager: ObservableObject {
         if let wt = doubleParam("wt") ?? doubleParam("weight") {
             let fat = doubleParam("fat") ?? doubleParam("bodyfat")
             let ht = doubleParam("ht") ?? doubleParam("height")
-            saveFemmtoMeasurement(weightKg: wt, bodyFatPercent: fat, heightCm: ht, source: "Femmto")
+            saveBodyMeasurement(weightKg: wt, bodyFatPercent: fat, heightCm: ht, source: "Apple Health")
         }
     }
 
@@ -170,7 +165,7 @@ final class HealthKitSyncManager: ObservableObject {
         }
     }
 
-    // MARK: - Lectura de composición corporal desde Apple Salud (Femmto → Salud → Watch Bridge)
+    // MARK: - Lectura de composición corporal desde Apple Health
 
     func refreshBodyComposition() async {
         guard isAvailable else { return }
@@ -203,7 +198,7 @@ final class HealthKitSyncManager: ObservableObject {
         comp.leanMassKg = l?.quantity.doubleValue(for: .gramUnit(with: .kilo))
             ?? (wKg != nil && fPct != nil ? wKg! * (1.0 - fPct! / 100.0) : nil)
         comp.measuredAt = reference?.endDate ?? Date()
-        comp.sourceName = reference?.sourceRevision.source.name ?? "Femmto"
+        comp.sourceName = reference?.sourceRevision.source.name ?? "Apple Health"
 
         if comp != bodyComposition {
             bodyComposition = comp

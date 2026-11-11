@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import UIKit
 import UserNotifications
 
 @MainActor
@@ -29,8 +30,10 @@ final class PhoneFindMyAlarmManager: ObservableObject {
         isRinging = true
 
         postLocalFindPhoneNotification()
-        startSynthesizedSiren()
-        startTorchStrobe()
+        if UIApplication.shared.applicationState == .active {
+            startSynthesizedSiren()
+            startTorchStrobe()
+        }
 
         autoStopTask?.cancel()
         autoStopTask = Task {
@@ -114,9 +117,11 @@ final class PhoneFindMyAlarmManager: ObservableObject {
 
     private func postLocalFindPhoneNotification() {
         let content = UNMutableNotificationContent()
-        content.title = "⌚ Galaxy Watch 6 está buscando tu iPhone"
-        content.body = "Tocá para abrir Watch Bridge y detener la sirena y el flash."
-        content.sound = .default
+        content.title = "Tu reloj está buscando este iPhone"
+        content.body = "Tocá para abrir Watch Bridge. Si la app está abierta, también suena la sirena."
+        content.sound = UNNotificationSound(named: UNNotificationSoundName("find_iphone.caf"))
+        content.interruptionLevel = .timeSensitive
+        content.relevanceScore = 1.0
 
         let request = UNNotificationRequest(
             identifier: "find_my_iphone_alert",

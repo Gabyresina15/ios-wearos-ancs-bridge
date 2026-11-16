@@ -104,8 +104,9 @@ final class RemoteCameraController: NSObject, ObservableObject {
 
         authorizationDenied = false
         sessionQueue.async { [weak self] in
-            self?.configureSessionIfNeeded()
-            if let self, !self.session.isRunning {
+            guard let self else { return }
+            self.configureSessionIfNeeded()
+            if !self.session.isRunning {
                 self.session.startRunning()
             }
             DispatchQueue.main.async {
